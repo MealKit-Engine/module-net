@@ -1,8 +1,8 @@
-#include "aster/net/Lockstep.h"
+#include "mealkit/net/Lockstep.h"
 
-#include "aster/core/Hash.h"
-#include "aster/core/Log.h"
-#include "aster/core/Profile.h"
+#include "mealkit/core/Hash.h"
+#include "mealkit/core/Log.h"
+#include "mealkit/core/Profile.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace aster::net {
+namespace mealkit::net {
 namespace {
 
 constexpr u32 kMagic = 0x52545341u; // "ASTR"
@@ -218,7 +218,7 @@ struct LockstepSession::Impl {
 
     void end(const char* reason) {
         if (state == SessionState::Ended) return;
-        ASTER_WARN("Session ended: %s", reason);
+        MEALKIT_WARN("Session ended: %s", reason);
         endReason = reason;
         Writer w;
         header(w, Packet::Disconnect);
@@ -233,7 +233,7 @@ struct LockstepSession::Impl {
         if (desynced) return;
         desynced = true;
         desyncTick = tick;
-        ASTER_ERROR("DESYNC at tick %u: host %016llx vs player %u %016llx", tick,
+        MEALKIT_ERROR("DESYNC at tick %u: host %016llx vs player %u %016llx", tick,
                     static_cast<unsigned long long>(hostHash), player, static_cast<unsigned long long>(peerHash));
     }
 
@@ -296,7 +296,7 @@ struct LockstepSession::Impl {
         w.put(static_cast<u8>(playerCount));
         for (u32 i = 0; i < count; ++i) {
             const Slot& s = slot(first + i);
-            ASTER_ASSERT(s.tick == first + i && s.complete);
+            MEALKIT_ASSERT(s.tick == first + i && s.complete);
             for (u32 player = 0; player < playerCount; ++player) w.bytes(s.inputs.players[player].bytes, kInputBytes);
         }
         send(p.address, w);
@@ -335,7 +335,7 @@ struct LockstepSession::Impl {
                 p.lastRecv = now;
                 peers.push_back(p);
                 peer = &peers.back();
-                ASTER_INFO("Player joined from %s (%zu/%u)", from.toString().c_str(), peers.size() + 1, maxPlayers);
+                MEALKIT_INFO("Player joined from %s (%zu/%u)", from.toString().c_str(), peers.size() + 1, maxPlayers);
             }
             sendAccept(*peer);
             break;
@@ -387,7 +387,7 @@ struct LockstepSession::Impl {
                 snprintf(reason, sizeof(reason), "Player %u left the match", peer->playerId);
                 end(reason);
             } else {
-                ASTER_INFO("Player left the lobby (%s)", from.toString().c_str());
+                MEALKIT_INFO("Player left the lobby (%s)", from.toString().c_str());
                 peers.erase(peers.begin() + (peer - peers.data()));
             }
             break;
@@ -401,7 +401,7 @@ struct LockstepSession::Impl {
         if (state == SessionState::Lobby) {
             for (size_t i = 0; i < peers.size();) {
                 if (now - peers[i].lastRecv > kTimeout) {
-                    ASTER_INFO("Lobby: %s timed out", peers[i].address.toString().c_str());
+                    MEALKIT_INFO("Lobby: %s timed out", peers[i].address.toString().c_str());
                     peers.erase(peers.begin() + static_cast<std::ptrdiff_t>(i));
                     continue;
                 }
@@ -470,7 +470,7 @@ struct LockstepSession::Impl {
             if (!r.ok) return;
             if (state == SessionState::Connecting) {
                 state = SessionState::Lobby;
-                ASTER_INFO("Connected to %s - waiting for the host to start", from.toString().c_str());
+                MEALKIT_INFO("Connected to %s - waiting for the host to start", from.toString().c_str());
             }
             localPlayer = id;
             maxPlayers = maxP;
@@ -497,7 +497,7 @@ struct LockstepSession::Impl {
             seed = matchSeed;
             matchData = data;
             beginRunning();
-            ASTER_INFO("Match started: player %u of %u, input delay %u ticks", id, count, delay);
+            MEALKIT_INFO("Match started: player %u of %u, input delay %u ticks", id, count, delay);
             sendInput(); // 시작 확인
             break;
         }
@@ -520,7 +520,7 @@ struct LockstepSession::Impl {
             if ((flags & 1) && !desynced) {
                 desynced = true;
                 desyncTick = hostDesyncTick;
-                ASTER_ERROR("DESYNC reported by host at tick %u", hostDesyncTick);
+                MEALKIT_ERROR("DESYNC reported by host at tick %u", hostDesyncTick);
             }
             for (u32 i = 0; i < count; ++i) {
                 TickInputs in{};
@@ -604,7 +604,7 @@ bool LockstepSession::host(u16 port, u32 maxPlayers, u32 inputDelay, bool loopba
     m->netStarted = true;
     auto udp = std::make_unique<UdpTransport>();
     if (!udp->open(port, loopbackOnly)) return false;
-    ASTER_INFO("Hosting on UDP port %u", udp->localPort());
+    MEALKIT_INFO("Hosting on UDP port %u", udp->localPort());
     return hostWith(std::move(udp), maxPlayers, inputDelay);
 }
 
@@ -626,7 +626,7 @@ bool LockstepSession::hostWith(std::unique_ptr<Transport> transport, u32 maxPlay
     m->playerCount = 1;
     m->localPlayer = 0;
     m->state = SessionState::Lobby;
-    ASTER_INFO("Session open: max %u players, input delay %u ticks", m->maxPlayers, m->inputDelay);
+    MEALKIT_INFO("Session open: max %u players, input delay %u ticks", m->maxPlayers, m->inputDelay);
     return true;
 }
 
@@ -637,7 +637,7 @@ bool LockstepSession::joinWith(std::unique_ptr<Transport> transport, const Addre
     m->peers.assign(1, Peer{});
     m->peers[0].address = hostAddress;
     m->state = SessionState::Connecting;
-    ASTER_INFO("Connecting to %s ...", hostAddress.toString().c_str());
+    MEALKIT_INFO("Connecting to %s ...", hostAddress.toString().c_str());
     return true;
 }
 
@@ -657,12 +657,12 @@ void LockstepSession::startMatch(u64 seed, u32 matchData) {
         for (HashEntry& e : p.reported) e = HashEntry{};
     }
     m->beginRunning();
-    ASTER_INFO("Match started with %u player(s), seed %016llx", m->playerCount,
+    MEALKIT_INFO("Match started with %u player(s), seed %016llx", m->playerCount,
                static_cast<unsigned long long>(seed));
 }
 
 void LockstepSession::update(f64 now) {
-    ASTER_ZONE("Network");
+    MEALKIT_ZONE("Network");
     m->now = now;
     if (m->offline || m->state == SessionState::Idle || m->state == SessionState::Ended) return;
 
@@ -762,4 +762,4 @@ bool LockstepSession::desynced() const { return m->desynced; }
 u32 LockstepSession::desyncTick() const { return m->desyncTick; }
 const SessionStats& LockstepSession::stats() const { return m->stats; }
 
-} // namespace aster::net
+} // namespace mealkit::net

@@ -1,14 +1,14 @@
 #pragma once
 
-#include "aster/net/Socket.h"
+#include "mealkit/net/Socket.h"
 
 #include <memory>
 
-namespace aster::net {
+namespace mealkit::net {
 
 // 패킷 전송 계층. 락스텝 세션은 이 인터페이스만 쓴다.
 //   UdpTransport   : IP/포트 직접 (LAN, 개발, 같은 PC 테스트)
-//   Steam 전송     : Steam ID + Steam 릴레이 (aster/platform/Steam.h, SDK가 있을 때)
+//   Steam 전송     : Steam ID + Steam 릴레이 (mealkit/platform/Steam.h, SDK가 있을 때)
 class Transport {
 public:
     virtual ~Transport() = default;
@@ -27,4 +27,4 @@ private:
     UdpSocket m_socket;
 };
 
-} // namespace aster::net
+} // namespace mealkit::net

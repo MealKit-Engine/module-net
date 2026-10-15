@@ -1,7 +1,7 @@
 #pragma once
 
-#include "aster/core/Types.h"
-#include "aster/net/Transport.h"
+#include "mealkit/core/Types.h"
+#include "mealkit/net/Transport.h"
 
 #include <memory>
 
@@ -14,7 +14,7 @@
 //   3. 확정된 틱만 실행할 수 있다. 입력이 늦으면 시뮬레이션이 잠시 멈추고, 렌더링은 계속된다.
 // 패킷 손실은 재전송 대신 중복 전송으로 처리한다(확인받지 못한 입력을 매 패킷에 다시 싣는다).
 // 피어는 실행한 틱의 상태 해시를 보고하고, 호스트가 비교해 디싱크를 감지한다.
-namespace aster::net {
+namespace mealkit::net {
 
 inline constexpr u32 kMaxPlayers = 8;
 inline constexpr u32 kInputBytes = 8;   // 게임이 정의하는 플레이어 입력 크기 (틱당)
@@ -92,4 +92,4 @@ private:
     Impl* m;
 };
 
-} // namespace aster::net
+} // namespace mealkit::net
