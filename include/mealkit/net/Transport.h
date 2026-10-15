@@ -21,7 +21,9 @@ public:
     bool open(u16 port, bool loopbackOnly) { return m_socket.open(port, loopbackOnly); }
     u16 localPort() const { return m_socket.localPort(); }
     bool send(const Address& to, const void* data, u32 size) override { return m_socket.sendTo(to, data, size); }
-    i32 receive(Address& from, void* buffer, u32 capacity) override { return m_socket.receiveFrom(from, buffer, capacity); }
+    i32 receive(Address& from, void* buffer, u32 capacity) override {
+        return m_socket.receiveFrom(from, buffer, capacity);
+    }
 
 private:
     UdpSocket m_socket;

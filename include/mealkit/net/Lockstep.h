@@ -37,7 +37,7 @@ enum class SessionState : u8 {
 };
 
 struct SessionStats {
-    f32 rttMs = 0.0f;       // 클라이언트: 호스트 왕복 시간
+    f32 rttMs = 0.0f; // 클라이언트: 호스트 왕복 시간
     u32 sentBytesPerSec = 0;
     u32 recvBytesPerSec = 0;
 };

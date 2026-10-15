@@ -50,7 +50,9 @@ struct Writer {
     bool ok = true;
 
     template <class T>
-    void put(const T& v) { bytes(&v, sizeof(T)); }
+    void put(const T& v) {
+        bytes(&v, sizeof(T));
+    }
     void bytes(const void* p, u32 n) {
         if (size + n > kMaxPacket) {
             ok = false;
@@ -234,7 +236,7 @@ struct LockstepSession::Impl {
         desynced = true;
         desyncTick = tick;
         MEALKIT_ERROR("DESYNC at tick %u: host %016llx vs player %u %016llx", tick,
-                    static_cast<unsigned long long>(hostHash), player, static_cast<unsigned long long>(peerHash));
+                      static_cast<unsigned long long>(hostHash), player, static_cast<unsigned long long>(peerHash));
     }
 
     Peer* findPeer(const Address& a) {
@@ -392,8 +394,7 @@ struct LockstepSession::Impl {
             }
             break;
         }
-        default:
-            break;
+        default: break;
         }
     }
 
@@ -476,9 +477,7 @@ struct LockstepSession::Impl {
             maxPlayers = maxP;
             break;
         }
-        case Packet::ConnectReject:
-            end(rejectText(static_cast<Reject>(r.get<u8>())));
-            break;
+        case Packet::ConnectReject: end(rejectText(static_cast<Reject>(r.get<u8>()))); break;
         case Packet::Lobby:
             lobbyCount = r.get<u8>();
             maxPlayers = r.get<u8>();
@@ -538,11 +537,8 @@ struct LockstepSession::Impl {
             finalize();
             break;
         }
-        case Packet::Disconnect:
-            end("Host closed the session");
-            break;
-        default:
-            break;
+        case Packet::Disconnect: end("Host closed the session"); break;
+        default: break;
         }
     }
 
@@ -658,7 +654,7 @@ void LockstepSession::startMatch(u64 seed, u32 matchData) {
     }
     m->beginRunning();
     MEALKIT_INFO("Match started with %u player(s), seed %016llx", m->playerCount,
-               static_cast<unsigned long long>(seed));
+                 static_cast<unsigned long long>(seed));
 }
 
 void LockstepSession::update(f64 now) {
@@ -692,8 +688,7 @@ void LockstepSession::update(f64 now) {
 }
 
 void LockstepSession::shutdown() {
-    if (m->state == SessionState::Connecting || m->state == SessionState::Lobby ||
-        m->state == SessionState::Running) {
+    if (m->state == SessionState::Connecting || m->state == SessionState::Lobby || m->state == SessionState::Running) {
         Writer w;
         header(w, Packet::Disconnect);
         for (const Peer& p : m->peers) {
