@@ -136,6 +136,7 @@ struct LockstepSession::Impl {
     u32 matchData = 0;
     u32 inputDelay = 3;
     u64 contentHash = 0;
+    bool acceptOtherBuilds = false;
 
     Slot slots[kTickWindow];
     u32 finalNext = 0;    // 확정된 틱의 끝 (이 틱부터 미확정)
@@ -315,8 +316,11 @@ struct LockstepSession::Impl {
             const u64 content = r.get<u64>();
             if (!r.ok) return;
             if (build != buildId()) {
-                sendReject(from, Reject::BuildMismatch);
-                return;
+                if (!acceptOtherBuilds) {
+                    sendReject(from, Reject::BuildMismatch);
+                    return;
+                }
+                if (!peer) MEALKIT_WARN("Accepting a peer with a different build (%08X, test option)", build);
             }
             if (content != contentHash) {
                 sendReject(from, Reject::ContentMismatch);
@@ -579,6 +583,7 @@ LockstepSession::~LockstepSession() {
 }
 
 void LockstepSession::setContentHash(u64 hash) { m->contentHash = hash; }
+void LockstepSession::setAcceptOtherBuilds(bool accept) { m->acceptOtherBuilds = accept; }
 
 bool LockstepSession::startOffline(u64 seed, u32 matchData) {
     if (m->state != SessionState::Idle) return false;

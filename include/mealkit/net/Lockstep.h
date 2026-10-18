@@ -51,6 +51,8 @@ public:
 
     // 게임 데이터(씬 등)의 해시. host/join 전에 설정하면 다른 데이터를 가진 피어의 접속을 거부한다.
     void setContentHash(u64 hash);
+    // 호스트: 실행 파일이 다른 피어도 받는다. 컴파일러 비교 시험 전용(mp_test -ClientExe). 디싱크가 날 수 있다.
+    void setAcceptOtherBuilds(bool accept);
 
     // 혼자 플레이: 네트워크 없이 같은 코드 경로를 쓴다.
     bool startOffline(u64 seed, u32 matchData);
