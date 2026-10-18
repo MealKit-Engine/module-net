@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,8 @@ constexpr f64 kStartResendInterval = 0.1;
 constexpr f64 kTimeout = 10.0;
 constexpr u32 kMaxTicksPerPacket = 32;
 constexpr u32 kNoTick = 0xFFFFFFFFu;
+constexpr u32 kMaxPendingCommands = 256; // 호스트: 틱을 기다리는 명령
+constexpr u32 kMaxOutCommands = 64;      // 클라이언트: 호스트가 확인하지 않은 명령
 
 enum class Packet : u8 { ConnectRequest = 1, ConnectAccept, ConnectReject, Lobby, Start, Input, Bundle, Disconnect };
 enum class Reject : u8 { BuildMismatch = 1, Full, InProgress, ContentMismatch };
@@ -114,7 +117,15 @@ struct Peer {
     u32 inputNext = 0;          // 호스트: 이 클라이언트에게서 연속으로 받은 입력의 다음 틱
     u32 bundleNext = 0;         // 호스트: 이 클라이언트가 아직 못 받은 첫 확정 틱
     u32 echoTime = 0;           // RTT 측정용으로 되돌려 줄 상대 시각
+    u32 commandNext = 0;        // 호스트: 이 클라이언트에게서 받은 명령의 다음 번호
     HashEntry reported[kTickWindow];
+};
+
+struct Command {
+    u32 seq = 0;   // 클라이언트: 보낸 순서 번호
+    u8 player = 0; // 호스트: 보낸 플레이어
+    u8 size = 0;
+    u8 data[kMaxCommandBytes];
 };
 
 } // namespace
@@ -143,6 +154,9 @@ struct LockstepSession::Impl {
     u32 executedNext = 0; // 다음에 실행할 틱
 
     PlayerInput localInputs[kTickWindow]; // 클라이언트: 호스트가 확인하기 전까지 보관
+    std::deque<Command> outCommands;      // 클라이언트: 호스트가 확인하기 전까지 보관 (매 입력 패킷에 다시 싣는다)
+    u32 nextCommandSeq = 0;
+    std::vector<Command> pendingCommands; // 호스트: 받은 순서, 다음에 확정하는 틱에 싣는다
     u32 localSubmittedNext = 0;
     u32 hostInputAckNext = 0;
 
@@ -196,6 +210,9 @@ struct LockstepSession::Impl {
         hostInputAckNext = inputDelay;
         latestHashTick = kNoTick;
         desynced = false;
+        outCommands.clear();
+        pendingCommands.clear();
+        nextCommandSeq = 0;
         state = SessionState::Running;
     }
 
@@ -206,11 +223,35 @@ struct LockstepSession::Impl {
             if (s.tick != finalNext) break;
             if (!s.complete) {
                 if ((s.mask & allMask()) != allMask()) break;
+                if (host) packCommands(s.inputs);
                 s.complete = true;
             }
             ++finalNext;
         }
         return finalNext != before;
+    }
+
+    // 호스트: 기다리던 명령을 이 틱에 싣는다. 플레이어 번호 → 받은 순서, 넘치면 그 플레이어의 나머지는 다음 틱 (순서 유지)
+    void packCommands(TickInputs& in) {
+        in.commandBytes = 0;
+        if (pendingCommands.empty()) return;
+        std::vector<bool> taken(pendingCommands.size(), false);
+        for (u32 player = 0; player < kMaxPlayers; ++player) {
+            for (size_t i = 0; i < pendingCommands.size(); ++i) {
+                const Command& c = pendingCommands[i];
+                if (c.player != player) continue;
+                if (in.commandBytes + 2u + c.size > kCommandBytesPerTick) break;
+                in.commands[in.commandBytes] = c.player;
+                in.commands[in.commandBytes + 1] = c.size;
+                std::memcpy(in.commands + in.commandBytes + 2, c.data, c.size);
+                in.commandBytes = static_cast<u16>(in.commandBytes + 2u + c.size);
+                taken[i] = true;
+            }
+        }
+        size_t keep = 0;
+        for (size_t i = 0; i < pendingCommands.size(); ++i)
+            if (!taken[i]) pendingCommands[keep++] = pendingCommands[i];
+        pendingCommands.resize(keep);
     }
 
     void send(const Address& to, const Writer& w) {
@@ -289,11 +330,17 @@ struct LockstepSession::Impl {
         w.put(p.echoTime);
         w.put(static_cast<u8>(desynced ? 1 : 0));
         w.put(desyncTick);
+        w.put(p.commandNext);
         const u32 first = p.bundleNext;
-        const u32 perTick = playerCount * kInputBytes;
-        u32 count = finalNext > first ? finalNext - first : 0;
-        count = std::min(count, kMaxTicksPerPacket);
-        count = std::min(count, (kMaxPacket - 40) / perTick);
+        const u32 perTick = playerCount * kInputBytes + 2; // + 명령 바이트 수
+        const u32 available = finalNext > first ? std::min(finalNext - first, kMaxTicksPerPacket) : 0;
+        u32 count = 0, bytes = w.size + 4 + 2;
+        while (count < available) { // 명령이 있는 틱은 커서 패킷에 들어가는 만큼만
+            const u32 need = perTick + slot(first + count).inputs.commandBytes;
+            if (bytes + need > kMaxPacket) break;
+            bytes += need;
+            ++count;
+        }
         w.put(first);
         w.put(static_cast<u8>(count));
         w.put(static_cast<u8>(playerCount));
@@ -301,6 +348,8 @@ struct LockstepSession::Impl {
             const Slot& s = slot(first + i);
             MEALKIT_ASSERT(s.tick == first + i && s.complete);
             for (u32 player = 0; player < playerCount; ++player) w.bytes(s.inputs.players[player].bytes, kInputBytes);
+            w.put(s.inputs.commandBytes);
+            w.bytes(s.inputs.commands, s.inputs.commandBytes);
         }
         send(p.address, w);
         p.lastSend = now;
@@ -365,8 +414,7 @@ struct LockstepSession::Impl {
                 r.bytes(input.bytes, kInputBytes);
                 if (!r.ok) break;
                 const u32 t = first + i;
-                if (t < peer->inputNext) continue;
-                if (!inWindow(t)) break;
+                if (t < peer->inputNext || !inWindow(t)) continue;
                 Slot& s = claim(t);
                 if (!(s.mask & bit)) {
                     s.inputs.players[peer->playerId] = input;
@@ -377,6 +425,21 @@ struct LockstepSession::Impl {
                 const Slot& s = slot(peer->inputNext);
                 if (s.tick != peer->inputNext || !(s.mask & bit)) break;
                 ++peer->inputNext;
+            }
+            const u32 commandFirst = r.get<u32>();
+            const u8 commandCount = r.get<u8>();
+            for (u32 i = 0; r.ok && i < commandCount; ++i) {
+                Command c;
+                c.size = r.get<u8>();
+                if (c.size == 0 || c.size > kMaxCommandBytes) break;
+                r.bytes(c.data, c.size);
+                if (!r.ok) break;
+                const u32 seq = commandFirst + i;
+                if (seq < peer->commandNext) continue; // 이미 받은 것 (다시 실린 것)
+                if (seq > peer->commandNext || pendingCommands.size() >= kMaxPendingCommands) break;
+                c.player = peer->playerId;
+                pendingCommands.push_back(c);
+                ++peer->commandNext;
             }
             if (hashTick != kNoTick) {
                 peer->reported[hashTick % kTickWindow] = {hashTick, hash};
@@ -459,6 +522,15 @@ struct LockstepSession::Impl {
         w.put(first);
         w.put(static_cast<u8>(count));
         for (u32 i = 0; i < count; ++i) w.bytes(localInputs[(first + i) % kTickWindow].bytes, kInputBytes);
+        u32 commands = 0, bytes = w.size + 4 + 1;
+        while (commands < outCommands.size() && commands < 255 && bytes + 1 + outCommands[commands].size <= kMaxPacket)
+            bytes += 1 + outCommands[commands++].size;
+        w.put(outCommands.empty() ? nextCommandSeq : outCommands.front().seq);
+        w.put(static_cast<u8>(commands));
+        for (u32 i = 0; i < commands; ++i) {
+            w.put(outCommands[i].size);
+            w.bytes(outCommands[i].data, outCommands[i].size);
+        }
         send(h.address, w);
         h.lastSend = now;
     }
@@ -510,12 +582,14 @@ struct LockstepSession::Impl {
             const u32 echo = r.get<u32>();
             const u8 flags = r.get<u8>();
             const u32 hostDesyncTick = r.get<u32>();
+            const u32 commandAck = r.get<u32>();
             const u32 first = r.get<u32>();
             const u8 count = r.get<u8>();
             const u8 players = r.get<u8>();
             if (!r.ok || players != playerCount) return;
 
             hostInputAckNext = std::max(hostInputAckNext, std::min(inputAckNext, localSubmittedNext));
+            while (!outCommands.empty() && outCommands.front().seq < commandAck) outCommands.pop_front();
             if (echo) {
                 const f32 sample = static_cast<f32>(toMs(now) - echo);
                 stats.rttMs = stats.rttMs == 0.0f ? sample : stats.rttMs * 0.9f + sample * 0.1f;
@@ -528,6 +602,9 @@ struct LockstepSession::Impl {
             for (u32 i = 0; i < count; ++i) {
                 TickInputs in{};
                 for (u32 player = 0; player < players; ++player) r.bytes(in.players[player].bytes, kInputBytes);
+                in.commandBytes = r.get<u16>();
+                if (in.commandBytes > kCommandBytesPerTick) break;
+                r.bytes(in.commands, in.commandBytes);
                 if (!r.ok) break;
                 const u32 t = first + i;
                 if (t < finalNext || !inWindow(t)) continue;
@@ -656,6 +733,7 @@ void LockstepSession::startMatch(u64 seed, u32 matchData) {
         p.inputNext = m->inputDelay;
         p.bundleNext = m->inputDelay;
         p.echoTime = 0;
+        p.commandNext = 0;
         for (HashEntry& e : p.reported) e = HashEntry{};
     }
     m->beginRunning();
@@ -757,6 +835,24 @@ void LockstepSession::submitLocalInput(u32 tick, const PlayerInput& input) {
         m->localSubmittedNext = std::max(m->localSubmittedNext, tick + 1);
         m->sendInput();
     }
+}
+
+bool LockstepSession::submitCommand(const void* data, u32 size) {
+    if (m->state != SessionState::Running || size == 0 || size > kMaxCommandBytes) return false;
+    Command c;
+    c.size = static_cast<u8>(size);
+    std::memcpy(c.data, data, size);
+    if (m->host) {
+        if (m->pendingCommands.size() >= kMaxPendingCommands) return false;
+        c.player = m->localPlayer;
+        m->pendingCommands.push_back(c);
+    } else {
+        if (m->outCommands.size() >= kMaxOutCommands) return false;
+        c.seq = m->nextCommandSeq++;
+        m->outCommands.push_back(c);
+        m->sendPending = true;
+    }
+    return true;
 }
 
 bool LockstepSession::desynced() const { return m->desynced; }

@@ -14,11 +14,16 @@
 //   3. 확정된 틱만 실행할 수 있다. 입력이 늦으면 시뮬레이션이 잠시 멈추고, 렌더링은 계속된다.
 // 패킷 손실은 재전송 대신 중복 전송으로 처리한다(확인받지 못한 입력을 매 패킷에 다시 싣는다).
 // 피어는 실행한 틱의 상태 해시를 보고하고, 호스트가 비교해 디싱크를 감지한다.
+// 확정 명령(submitCommand): 가끔 있는 크기가 제각각인 명령(치트, 입력 지연 변경 등). 피어가 보내면 호스트가 확정하는 틱에 붙여
+// 그 틱의 입력과 함께 배포한다(입력과 같은 중복 전송, 클라이언트 → 호스트는 확인받을 때까지 다시 싣는다). 틱당 kCommandBytesPerTick까지,
+// 넘치면 다음 틱. 한 틱 안의 순서는 플레이어 번호 → 보낸 순서. 게임은 mealkit/sim/Commands.h로 타입을 붙여 쓴다.
 namespace mealkit::net {
 
 inline constexpr u32 kMaxPlayers = 8;
 inline constexpr u32 kInputBytes = 8;   // 게임이 정의하는 플레이어 입력 크기 (틱당)
 inline constexpr u32 kTickWindow = 256; // 동시에 다룰 수 있는 틱 범위 (30Hz 기준 약 8.5초)
+inline constexpr u32 kMaxCommandBytes = 200;     // 명령 하나의 최대 크기
+inline constexpr u32 kCommandBytesPerTick = 256; // 한 틱에 싣는 명령 (명령마다 머리 2바이트 포함)
 
 struct PlayerInput {
     u8 bytes[kInputBytes] = {};
@@ -26,7 +31,22 @@ struct PlayerInput {
 
 struct TickInputs {
     PlayerInput players[kMaxPlayers];
+    u16 commandBytes = 0;                     // commands에 쓴 바이트
+    u8 commands[kCommandBytesPerTick] = {};   // [플레이어 u8][크기 u8][내용] 반복 (forEachCommand로 읽는다)
 };
+
+// 이 틱의 확정 명령: f(플레이어, 내용, 크기)
+template <class F>
+void forEachCommand(const TickInputs& in, F&& f) {
+    u32 i = 0;
+    while (i + 2 <= in.commandBytes) {
+        const u8 player = in.commands[i];
+        const u32 size = in.commands[i + 1];
+        if (i + 2 + size > in.commandBytes) break;
+        f(player, in.commands + i + 2, size);
+        i += 2 + size;
+    }
+}
 
 enum class SessionState : u8 {
     Idle,       // 시작 전
@@ -85,6 +105,8 @@ public:
     void tickExecuted(u32 tick, u64 stateHash);
     // 로컬 입력을 (실행한 틱 + inputDelay) 틱용으로 제출한다.
     void submitLocalInput(u32 tick, const PlayerInput& input);
+    // 확정 명령을 보낸다 (Running일 때만, 크기 1..kMaxCommandBytes). 호스트가 다음에 확정하는 틱에 들어간다. 대기열이 차면 false.
+    bool submitCommand(const void* data, u32 size);
 
     bool desynced() const;
     u32 desyncTick() const;
