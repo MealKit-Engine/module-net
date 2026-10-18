@@ -118,6 +118,7 @@ struct Peer {
     u32 bundleNext = 0;         // 호스트: 이 클라이언트가 아직 못 받은 첫 확정 틱
     u32 echoTime = 0;           // RTT 측정용으로 되돌려 줄 상대 시각
     u32 commandNext = 0;        // 호스트: 이 클라이언트에게서 받은 명령의 다음 번호
+    std::vector<u8> loadout;    // 호스트: 로비에서 받은 이 클라이언트의 매치 시작 데이터
     HashEntry reported[kTickWindow];
 };
 
@@ -157,6 +158,8 @@ struct LockstepSession::Impl {
     std::deque<Command> outCommands;      // 클라이언트: 호스트가 확인하기 전까지 보관 (매 입력 패킷에 다시 싣는다)
     u32 nextCommandSeq = 0;
     std::vector<Command> pendingCommands; // 호스트: 받은 순서, 다음에 확정하는 틱에 싣는다
+    std::vector<u8> localLoadout;
+    std::vector<u8> loadouts[kMaxPlayers]; // 확정된 매치 시작 데이터
     u32 localSubmittedNext = 0;
     u32 hostInputAckNext = 0;
 
@@ -320,6 +323,10 @@ struct LockstepSession::Impl {
         w.put(static_cast<u8>(inputDelay));
         w.put(seed);
         w.put(matchData);
+        for (u32 i = 0; i < playerCount; ++i) {
+            w.put(static_cast<u8>(loadouts[i].size()));
+            w.bytes(loadouts[i].data(), static_cast<u32>(loadouts[i].size()));
+        }
         send(p.address, w);
     }
 
@@ -363,6 +370,9 @@ struct LockstepSession::Impl {
         case Packet::ConnectRequest: {
             const u32 build = r.get<u32>();
             const u64 content = r.get<u64>();
+            const u8 loadoutSize = r.get<u8>();
+            std::vector<u8> loadout(std::min<u32>(loadoutSize, kMaxLoadoutBytes));
+            r.bytes(loadout.data(), static_cast<u32>(loadout.size()));
             if (!r.ok) return;
             if (build != buildId()) {
                 if (!acceptOtherBuilds) {
@@ -392,6 +402,7 @@ struct LockstepSession::Impl {
                 peer = &peers.back();
                 MEALKIT_INFO("Player joined from %s (%zu/%u)", from.toString().c_str(), peers.size() + 1, maxPlayers);
             }
+            if (state == SessionState::Lobby) peer->loadout = std::move(loadout); // 로비 신호마다 새 값
             sendAccept(*peer);
             break;
         }
@@ -505,6 +516,8 @@ struct LockstepSession::Impl {
         header(w, Packet::ConnectRequest);
         w.put(buildId());
         w.put(contentHash);
+        w.put(static_cast<u8>(localLoadout.size()));
+        w.bytes(localLoadout.data(), static_cast<u32>(localLoadout.size()));
         send(peers[0].address, w);
     }
 
@@ -566,6 +579,12 @@ struct LockstepSession::Impl {
             const u32 data = r.get<u32>();
             if (!r.ok || state == SessionState::Running || state == SessionState::Ended) return;
             if (count == 0 || count > kMaxPlayers || id >= count || delay == 0) return;
+            for (u32 i = 0; i < count; ++i) {
+                const u8 size = r.get<u8>();
+                loadouts[i].resize(std::min<u32>(size, kMaxLoadoutBytes));
+                r.bytes(loadouts[i].data(), static_cast<u32>(loadouts[i].size()));
+            }
+            if (!r.ok) return;
             localPlayer = id;
             playerCount = count;
             inputDelay = delay;
@@ -673,6 +692,8 @@ bool LockstepSession::startOffline(u64 seed, u32 matchData) {
     m->inputDelay = 1;
     m->seed = seed;
     m->matchData = matchData;
+    for (std::vector<u8>& l : m->loadouts) l.clear();
+    m->loadouts[0] = m->localLoadout;
     m->beginRunning();
     return true;
 }
@@ -720,9 +741,27 @@ bool LockstepSession::joinWith(std::unique_ptr<Transport> transport, const Addre
     return true;
 }
 
+bool LockstepSession::setLocalLoadout(const void* data, u32 size) {
+    if (size > kMaxLoadoutBytes || m->state == SessionState::Running || m->state == SessionState::Ended) return false;
+    const u8* bytes = static_cast<const u8*>(data);
+    const std::vector<u8> next(bytes, bytes + size);
+    if (next == m->localLoadout) return true;
+    m->localLoadout = next;
+    if (!m->host && !m->peers.empty()) m->peers[0].lastControlSend = -1.0; // 로비에 있으면 바로 다시 보낸다
+    return true;
+}
+
+const std::vector<u8>& LockstepSession::loadout(u32 player) const {
+    static const std::vector<u8> none;
+    return player < kMaxPlayers ? m->loadouts[player] : none;
+}
+
 void LockstepSession::startMatch(u64 seed, u32 matchData) {
     if (!m->host || m->state != SessionState::Lobby) return;
     m->playerCount = 1 + static_cast<u32>(m->peers.size());
+    for (std::vector<u8>& l : m->loadouts) l.clear();
+    m->loadouts[0] = m->localLoadout;
+    for (size_t i = 0; i < m->peers.size(); ++i) m->loadouts[i + 1] = m->peers[i].loadout;
     m->seed = seed;
     m->matchData = matchData;
     for (size_t i = 0; i < m->peers.size(); ++i) {

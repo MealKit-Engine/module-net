@@ -4,6 +4,7 @@
 #include "mealkit/net/Transport.h"
 
 #include <memory>
+#include <vector>
 
 // 결정론적 락스텝 세션.
 //
@@ -24,6 +25,7 @@ inline constexpr u32 kInputBytes = 8;   // 게임이 정의하는 플레이어 �
 inline constexpr u32 kTickWindow = 256; // 동시에 다룰 수 있는 틱 범위 (30Hz 기준 약 8.5초)
 inline constexpr u32 kMaxCommandBytes = 200;     // 명령 하나의 최대 크기
 inline constexpr u32 kCommandBytesPerTick = 256; // 한 틱에 싣는 명령 (명령마다 머리 2바이트 포함)
+inline constexpr u32 kMaxLoadoutBytes = 128;     // 플레이어 한 명의 매치 시작 데이터 (시작 패킷 하나에 8명이 들어가게)
 
 struct PlayerInput {
     u8 bytes[kInputBytes] = {};
@@ -83,6 +85,11 @@ public:
     // 다른 전송 계층(Steam 등)으로 방 만들기/참가
     bool hostWith(std::unique_ptr<Transport> transport, u32 maxPlayers, u32 inputDelay);
     bool joinWith(std::unique_ptr<Transport> transport, const Address& hostAddress);
+    // 매치 시작 데이터 (플레이어별 로드아웃, mealkit/game/Loadout.h): 매치 전에 정한다. 클라이언트는 로비 신호(1초마다)에 실어 보내고,
+    // 호스트가 startMatch 때 모든 플레이어 것을 확정해 시작 패킷으로 배포한다. 크기는 kMaxLoadoutBytes까지 (넘으면 false)
+    bool setLocalLoadout(const void* data, u32 size);
+    // 확정된 로드아웃 (Running 이후, 플레이어 번호마다. 보내지 않았으면 비어 있다)
+    const std::vector<u8>& loadout(u32 player) const;
     // 호스트 전용: 로비 → 진행. seed와 matchData(게임이 정하는 매치 설정값)를 모두에게 보낸다.
     void startMatch(u64 seed, u32 matchData);
     // 매 프레임 호출: 패킷 수신, 확정, 송신.
