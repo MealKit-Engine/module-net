@@ -583,6 +583,7 @@ LockstepSession::~LockstepSession() {
 }
 
 void LockstepSession::setContentHash(u64 hash) { m->contentHash = hash; }
+u64 LockstepSession::contentHash() const { return m->contentHash; }
 void LockstepSession::setAcceptOtherBuilds(bool accept) { m->acceptOtherBuilds = accept; }
 
 bool LockstepSession::startOffline(u64 seed, u32 matchData) {
