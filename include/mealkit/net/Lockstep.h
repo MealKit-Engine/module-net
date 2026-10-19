@@ -101,8 +101,23 @@ struct AutoDelay {
 // 이 왕복 시간(ms)에 맞는 입력 지연 (틱): 가장 먼 상대의 입력이 호스트를 거쳐 모두에게 닿을 시간 + 흔들림 여유 + 한 틱
 u32 delayForRtt(f32 rttMs, const AutoDelay& autoDelay);
 
-// 실행 파일마다 다른 값 (같은 빌드끼리만 접속한다: 결정론은 같은 기계어 코드를 전제로 한다)
+// 실행 파일마다 다른 값 (시뮬레이션 버전을 모를 때 대신 쓴다)
 u32 buildId();
+// 결정론 그룹: 컴파일러와 CPU ("msvc-x64", "clang-x64", "clang-arm64" ...). 플랫폼 사이 결정론을 확인하기 전까지(5단계)
+// 그룹이 다른 피어는 받지 않는다
+const char* determinismGroup();
+
+// 콘텐츠 해시 구성 (거부 이유를 알려 주려고 따로 비교한다): game::MatchData::contentParts의 순서
+enum class ContentPart : u8 { Scene, Models, Tuning, Project, Tables, Count };
+
+// 접속 거부 이유 (클라이언트, rejectInfo())
+enum class RejectReason : u8 { None, Version, Platform, Content, Full, InProgress };
+struct RejectInfo {
+    RejectReason reason = RejectReason::None;
+    u32 contentMask = 0;     // Content: 다른 구성 (비트 = ContentPart)
+    std::string hostVersion; // Version: 방장의 게임 버전
+    std::string hostGroup;   // Platform: 방장의 결정론 그룹
+};
 
 class LockstepSession {
 public:
@@ -114,6 +129,12 @@ public:
     // 게임 데이터(씬 등)의 해시. host/join 전에 설정하면 다른 데이터를 가진 피어의 접속을 거부한다.
     void setContentHash(u64 hash);
     u64 contentHash() const;
+    // 해시 구성 (ContentPart 순서, Count개): 거부할 때 무엇이 다른지 알려 준다
+    void setContentParts(const u64* parts);
+    // 이 빌드의 시뮬레이션 버전과 게임 버전 (game::BuildInfo). 시뮬레이션 버전이 다른 피어는 받지 않는다 (0이면 buildId)
+    void setBuild(u64 simVersion, const std::string& gameVersion);
+    // 클라이언트: 호스트가 접속을 거부한 이유 (Ended 뒤)
+    const RejectInfo& rejectInfo() const;
     // 호스트: 실행 파일이 다른 피어도 받는다. 컴파일러 비교 시험 전용(mp_test -ClientExe). 디싱크가 날 수 있다.
     void setAcceptOtherBuilds(bool accept);
     // 네트워크 상태 흉내 (지연·흔들림·손실, mealkit/net/Conditions.h): host/join 전에. 시험용

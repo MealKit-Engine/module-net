@@ -10,7 +10,7 @@ namespace mealkit::net {
 namespace {
 
 constexpr u32 kRoomMagic = 0x4D524B4Du; // "MKRM"
-constexpr u8 kRoomVersion = 1;
+constexpr u8 kRoomVersion = 2;
 
 void putText(std::vector<u8>& out, const std::string& s) {
     const std::string t = clampUtf8(s, 64);
@@ -79,13 +79,15 @@ void RoomAnnouncer::update(f64 now, const RoomAnnouncement& room) {
     std::vector<u8> packet;
     putValue(packet, kRoomMagic);
     putValue(packet, kRoomVersion);
-    putValue(packet, room.build);
+    putValue(packet, room.simVersion);
     putValue(packet, room.contentHash);
     putValue(packet, room.port);
     putValue(packet, room.players);
     putValue(packet, room.maxPlayers);
     putText(packet, room.game);
     putText(packet, room.hostName);
+    putText(packet, room.version);
+    putText(packet, room.group);
     const u32 size = static_cast<u32>(packet.size());
     if (m_broadcast) m_socket.sendTo({kBroadcastIp, kRoomPort}, packet.data(), size);
     m_socket.sendTo({kLoopbackIp, kRoomPort}, packet.data(), size); // 같은 PC (브로드캐스트가 돌아오지 않는 환경)
@@ -119,13 +121,15 @@ void RoomFinder::update(f64 now) {
         RoomReader r{buffer, static_cast<u32>(received)};
         if (r.get<u32>() != kRoomMagic || r.get<u8>() != kRoomVersion) continue;
         Room room;
-        room.build = r.get<u32>();
+        room.simVersion = r.get<u64>();
         room.contentHash = r.get<u64>();
         room.port = r.get<u16>();
         room.players = r.get<u8>();
         room.maxPlayers = r.get<u8>();
         room.game = r.text();
         room.hostName = r.text();
+        room.version = r.text();
+        room.group = r.text();
         if (!r.ok || room.game != m_game) continue;
         room.address = {from.ip, room.port};
         room.lastSeen = now;

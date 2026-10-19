@@ -48,7 +48,7 @@ enum class Packet : u8 {
     ChatRelay, // 호스트 → 클라이언트: 모두의 채팅 + 보낸 채팅 확인
     Roster,    // 호스트 → 클라이언트: 매치 중 명단 (로비 신호와 같은 모양: 이름·핑, 로비로 돌아가지는 않는다)
 };
-enum class Reject : u8 { BuildMismatch = 1, Full, InProgress, ContentMismatch };
+using Reject = RejectReason;
 
 constexpr u8 kMemberReady = 1;
 constexpr u8 kMemberHost = 2;
@@ -57,10 +57,12 @@ u32 toMs(f64 seconds) { return static_cast<u32>(seconds * 1000.0) + 1; } // 0은
 
 const char* rejectText(Reject r) {
     switch (r) {
-    case Reject::BuildMismatch: return "Host runs a different build (all players need the same executable)";
+    case Reject::Version: return "Host runs a different game version";
+    case Reject::Platform: return "Host runs a build for another platform or compiler";
     case Reject::Full: return "Session is full";
     case Reject::InProgress: return "Match already in progress";
-    case Reject::ContentMismatch: return "Host uses different game data (scene file differs)";
+    case Reject::Content: return "Host uses different game data";
+    case Reject::None: break;
     }
     return "Connection rejected";
 }
@@ -180,6 +182,25 @@ struct RelayChat { // 호스트: 모두에게 나눠 주는 채팅 (번호 순)
 
 } // namespace
 
+const char* determinismGroup() {
+#if defined(__clang__)
+#define MEALKIT_GROUP_COMPILER "clang"
+#elif defined(_MSC_VER)
+#define MEALKIT_GROUP_COMPILER "msvc"
+#elif defined(__GNUC__)
+#define MEALKIT_GROUP_COMPILER "gcc"
+#else
+#define MEALKIT_GROUP_COMPILER "other"
+#endif
+#if defined(_M_X64) || defined(__x86_64__)
+    return MEALKIT_GROUP_COMPILER "-x64";
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    return MEALKIT_GROUP_COMPILER "-arm64";
+#else
+    return MEALKIT_GROUP_COMPILER "-other";
+#endif
+}
+
 u32 buildId() {
     static const u32 id = static_cast<u32>(fnv1a(__DATE__ " " __TIME__));
     return id;
@@ -209,6 +230,10 @@ struct LockstepSession::Impl {
     u32 matchData = 0;
     u32 inputDelay = 3;
     u64 contentHash = 0;
+    u64 contentParts[static_cast<u32>(ContentPart::Count)] = {};
+    u64 simVersion = 0;      // 0이면 buildId()
+    std::string gameVersion;
+    RejectInfo rejectInfo;   // 클라이언트: 거부당한 이유
     bool acceptOtherBuilds = false;
     NetConditions conditions;
     AutoDelay autoDelay;
@@ -508,10 +533,15 @@ struct LockstepSession::Impl {
         send(p.address, w);
     }
 
-    void sendReject(const Address& to, Reject reason) {
+    u64 mySimVersion() const { return simVersion ? simVersion : buildId(); }
+
+    void sendReject(const Address& to, Reject reason, u32 contentMask = 0) {
         Writer w;
         header(w, Packet::ConnectReject);
         w.put(static_cast<u8>(reason));
+        w.put(contentMask);
+        w.text(gameVersion);
+        w.text(determinismGroup());
         send(to, w);
     }
 
@@ -645,8 +675,12 @@ struct LockstepSession::Impl {
 
         switch (type) {
         case Packet::ConnectRequest: {
-            const u32 build = r.get<u32>();
+            const u64 build = r.get<u64>();
+            const std::string group = r.text(32);
+            const std::string version = r.text(64);
             const u64 content = r.get<u64>();
+            u64 parts[static_cast<u32>(ContentPart::Count)] = {};
+            for (u64& part : parts) part = r.get<u64>();
             const u8 loadoutSize = r.get<u8>();
             std::vector<u8> loadout(std::min<u32>(loadoutSize, kMaxLoadoutBytes));
             r.bytes(loadout.data(), static_cast<u32>(loadout.size()));
@@ -654,15 +688,19 @@ struct LockstepSession::Impl {
             std::string name = r.text(kMaxNameBytes);
             const u32 hostEcho = r.get<u32>();
             if (!r.ok) return;
-            if (build != buildId()) {
+            // 같은 시뮬레이션이어야 한다: 결정론 그룹(컴파일러·CPU) → 시뮬레이션 버전(게임 버전 + 시뮬레이션 소스) → 게임 데이터
+            if (group != determinismGroup() || build != mySimVersion()) {
                 if (!acceptOtherBuilds) {
-                    sendReject(from, Reject::BuildMismatch);
+                    sendReject(from, group != determinismGroup() ? Reject::Platform : Reject::Version);
                     return;
                 }
-                if (!peer) MEALKIT_WARN("Accepting a peer with a different build (%08X, test option)", build);
+                if (!peer) MEALKIT_WARN("Accepting a peer with a different build (%s %s, test option)", group.c_str(), version.c_str());
             }
             if (content != contentHash) {
-                sendReject(from, Reject::ContentMismatch);
+                u32 mask = 0;
+                for (u32 i = 0; i < static_cast<u32>(ContentPart::Count); ++i)
+                    if (parts[i] != contentParts[i]) mask |= 1u << i;
+                sendReject(from, Reject::Content, mask);
                 return;
             }
             if (!peer) {
@@ -841,8 +879,11 @@ struct LockstepSession::Impl {
     void sendConnect() {
         Writer w;
         header(w, Packet::ConnectRequest);
-        w.put(buildId());
+        w.put(mySimVersion());
+        w.text(determinismGroup());
+        w.text(gameVersion);
         w.put(contentHash);
+        for (u64 part : contentParts) w.put(part);
         w.put(static_cast<u8>(localLoadout.size()));
         w.bytes(localLoadout.data(), static_cast<u32>(localLoadout.size()));
         w.put(static_cast<u8>(localReady ? kMemberReady : 0));
@@ -927,7 +968,17 @@ struct LockstepSession::Impl {
             maxPlayers = maxP;
             break;
         }
-        case Packet::ConnectReject: end(rejectText(static_cast<Reject>(r.get<u8>()))); break;
+        case Packet::ConnectReject: {
+            rejectInfo.reason = static_cast<Reject>(r.get<u8>());
+            rejectInfo.contentMask = r.get<u32>();
+            rejectInfo.hostVersion = r.text(64);
+            rejectInfo.hostGroup = r.text(32);
+            std::string reason = rejectText(rejectInfo.reason);
+            if (rejectInfo.reason == Reject::Version) reason += " (yours " + gameVersion + ", host " + rejectInfo.hostVersion + ")";
+            if (rejectInfo.reason == Reject::Platform) reason += " (yours " + std::string(determinismGroup()) + ", host " + rejectInfo.hostGroup + ")";
+            end(reason.c_str());
+            break;
+        }
         case Packet::Lobby:
         case Packet::Roster: {
             const u8 count = r.get<u8>();
@@ -1134,6 +1185,14 @@ LockstepSession::~LockstepSession() {
 }
 
 void LockstepSession::setContentHash(u64 hash) { m->contentHash = hash; }
+void LockstepSession::setContentParts(const u64* parts) {
+    for (u32 i = 0; i < static_cast<u32>(ContentPart::Count); ++i) m->contentParts[i] = parts[i];
+}
+void LockstepSession::setBuild(u64 simVersion, const std::string& gameVersion) {
+    m->simVersion = simVersion;
+    m->gameVersion = gameVersion;
+}
+const RejectInfo& LockstepSession::rejectInfo() const { return m->rejectInfo; }
 u64 LockstepSession::contentHash() const { return m->contentHash; }
 void LockstepSession::setAcceptOtherBuilds(bool accept) { m->acceptOtherBuilds = accept; }
 void LockstepSession::setConditions(const NetConditions& conditions) { m->conditions = conditions; }
@@ -1351,6 +1410,9 @@ void LockstepSession::reset() {
     fresh->contentHash = m->contentHash;
     fresh->acceptOtherBuilds = m->acceptOtherBuilds;
     fresh->conditions = m->conditions;
+    std::copy(std::begin(m->contentParts), std::end(m->contentParts), std::begin(fresh->contentParts));
+    fresh->simVersion = m->simVersion;
+    fresh->gameVersion = m->gameVersion;
     fresh->autoDelay = m->autoDelay;
     fresh->localName = m->localName;
     fresh->localLoadout = m->localLoadout;

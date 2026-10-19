@@ -19,7 +19,9 @@ inline constexpr f64 kRoomTimeout = 3.5; // 이만큼 알림이 없으면 목록
 struct RoomAnnouncement {
     std::string game;     // 게임 이름 (프로젝트 이름)
     std::string hostName; // 방장 이름
-    u32 build = 0;        // net::buildId()
+    u64 simVersion = 0;   // 시뮬레이션 버전 (game::BuildInfo, 0이면 net::buildId)
+    std::string version;  // 게임 버전 (보이기만)
+    std::string group;    // 결정론 그룹 (net::determinismGroup)
     u64 contentHash = 0;
     u16 port = 0;         // 락스텝 세션 포트
     u8 players = 0, maxPlayers = 0;
