@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mealkit/core/Types.h"
+#include "mealkit/net/Conditions.h"
 #include "mealkit/net/Transport.h"
 
 #include <memory>
@@ -103,6 +104,8 @@ public:
     u64 contentHash() const;
     // 호스트: 실행 파일이 다른 피어도 받는다. 컴파일러 비교 시험 전용(mp_test -ClientExe). 디싱크가 날 수 있다.
     void setAcceptOtherBuilds(bool accept);
+    // 네트워크 상태 흉내 (지연·흔들림·손실, mealkit/net/Conditions.h): host/join 전에. 시험용
+    void setConditions(const NetConditions& conditions);
 
     // 혼자 플레이: 네트워크 없이 같은 코드 경로를 쓴다. startOffline은 바로 매치, openOffline은 로비부터(startMatch로 시작)
     bool startOffline(u64 seed, u32 matchData);

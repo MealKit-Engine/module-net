@@ -201,6 +201,7 @@ struct LockstepSession::Impl {
     u32 inputDelay = 3;
     u64 contentHash = 0;
     bool acceptOtherBuilds = false;
+    NetConditions conditions;
     u32 matchIndex = 0; // 시작한 매치 수 (호스트가 정하고 시작·로비 패킷으로 알린다)
 
     Slot slots[kTickWindow];
@@ -1007,6 +1008,7 @@ LockstepSession::~LockstepSession() {
 void LockstepSession::setContentHash(u64 hash) { m->contentHash = hash; }
 u64 LockstepSession::contentHash() const { return m->contentHash; }
 void LockstepSession::setAcceptOtherBuilds(bool accept) { m->acceptOtherBuilds = accept; }
+void LockstepSession::setConditions(const NetConditions& conditions) { m->conditions = conditions; }
 
 bool LockstepSession::openOffline() {
     if (m->state != SessionState::Idle) return false;
@@ -1048,7 +1050,7 @@ bool LockstepSession::join(const Address& hostAddress) {
 
 bool LockstepSession::hostWith(std::unique_ptr<Transport> transport, u32 maxPlayers, u32 inputDelay) {
     if (m->state != SessionState::Idle || !transport) return false;
-    m->transport = std::move(transport);
+    m->transport = withConditions(std::move(transport), m->conditions);
     m->host = true;
     m->maxPlayers = std::clamp(maxPlayers, 1u, kMaxPlayers);
     m->inputDelay = std::clamp(inputDelay, 1u, 30u);
@@ -1062,7 +1064,7 @@ bool LockstepSession::hostWith(std::unique_ptr<Transport> transport, u32 maxPlay
 
 bool LockstepSession::joinWith(std::unique_ptr<Transport> transport, const Address& hostAddress) {
     if (m->state != SessionState::Idle || !transport) return false;
-    m->transport = std::move(transport);
+    m->transport = withConditions(std::move(transport), m->conditions);
     m->host = false;
     m->peers.assign(1, Peer{});
     m->peers[0].address = hostAddress;
@@ -1204,6 +1206,7 @@ void LockstepSession::reset() {
     Impl* fresh = new Impl();
     fresh->contentHash = m->contentHash;
     fresh->acceptOtherBuilds = m->acceptOtherBuilds;
+    fresh->conditions = m->conditions;
     fresh->localName = m->localName;
     fresh->localLoadout = m->localLoadout;
     delete m;
