@@ -79,6 +79,7 @@ struct LobbyMember {
     std::string name;
     bool ready = false;
     bool host = false;
+    u32 pingMs = 0; // 호스트와의 왕복 시간 (호스트가 잰다, 호스트 자신은 0)
     std::vector<u8> loadout; // 그 사람이 고른 매치 시작 데이터 (game::readLobbyLoadout으로 읽는다)
 };
 
@@ -168,6 +169,11 @@ public:
     bool desynced() const;
     u32 desyncTick() const;
     const SessionStats& stats() const;
+    // 플레이어별 호스트와의 왕복 시간 (ms, 호스트가 로비·매치 동안 재서 모두에게 나눠 준다. 호스트는 0)
+    u32 pingMs(u32 player) const;
+    // 매치가 이 플레이어들의 입력을 기다리며 멈춰 있다 (비트 = 플레이어 번호, 0.15초 넘게 멈췄을 때만).
+    // 클라이언트는 호스트가 알려 준 값, 호스트의 묶음이 0.3초 넘게 오지 않으면 호스트(비트 0)
+    u32 waitingFor() const;
 
 private:
     struct Impl;

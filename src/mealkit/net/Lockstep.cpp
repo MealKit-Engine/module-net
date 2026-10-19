@@ -22,6 +22,8 @@ constexpr f64 kConnectInterval = 0.25;
 constexpr f64 kStartResendInterval = 0.1;
 constexpr f64 kChatResendInterval = 0.1;
 constexpr f64 kTimeout = 10.0;
+constexpr f64 kStallReport = 0.15;     // 이만큼 확정이 멈추면 누구를 기다리는지 알린다
+constexpr f64 kHostSilence = 0.3;      // 클라이언트: 호스트 묶음이 이만큼 없으면 호스트를 기다린다
 constexpr u32 kMaxTicksPerPacket = 32;
 constexpr u32 kNoTick = 0xFFFFFFFFu;
 constexpr u32 kMaxPendingCommands = 256; // 호스트: 틱을 기다리는 명령
@@ -40,6 +42,7 @@ enum class Packet : u8 {
     Disconnect,
     Chat,      // 클라이언트 → 호스트: 보낼 채팅 + 받은 채팅 확인
     ChatRelay, // 호스트 → 클라이언트: 모두의 채팅 + 보낸 채팅 확인
+    Roster,    // 호스트 → 클라이언트: 매치 중 명단 (로비 신호와 같은 모양: 이름·핑, 로비로 돌아가지는 않는다)
 };
 enum class Reject : u8 { BuildMismatch = 1, Full, InProgress, ContentMismatch };
 
@@ -141,6 +144,8 @@ struct Peer {
     u32 bundleNext = 0;         // 호스트: 이 클라이언트가 아직 못 받은 첫 확정 틱
     u32 echoTime = 0;           // RTT 측정용으로 되돌려 줄 상대 시각
     u32 commandNext = 0;        // 호스트: 이 클라이언트에게서 받은 명령의 다음 번호
+    f32 rttMs = 0.0f;           // 호스트: 이 클라이언트와의 왕복 시간 (지수 평균)
+    u32 hostEcho = 0;           // 클라이언트: 호스트가 보낸 시각 (되돌려 줘서 호스트가 왕복 시간을 잰다)
     std::vector<u8> loadout;    // 호스트: 로비에서 받은 이 클라이언트의 매치 시작 데이터
     std::string name;           // 호스트: 로비 이름
     bool ready = false;         // 호스트: 로비 준비
@@ -217,6 +222,12 @@ struct LockstepSession::Impl {
     u32 localSubmittedNext = 0;
     u32 hostInputAckNext = 0;
 
+    // 왕복 시간·멈춤 (플레이어용 네트워크 표시, 입력 지연 자동 조절)
+    u32 playerPing[kMaxPlayers] = {};
+    u32 waitMask = 0;
+    f64 lastFinalize = 0.0; // 호스트: finalNext가 마지막으로 나아간 시각
+    f64 lastBundle = 0.0;   // 클라이언트: 마지막 묶음 수신
+
     // 로비
     std::string localName;
     bool localReady = false;
@@ -283,6 +294,8 @@ struct LockstepSession::Impl {
             s.complete = true;
         }
         finalNext = inputDelay;
+        lastFinalize = lastBundle = now;
+        waitMask = 0;
         executedNext = 0;
         localSubmittedNext = inputDelay;
         hostInputAckNext = inputDelay;
@@ -293,6 +306,12 @@ struct LockstepSession::Impl {
         pendingCommands.clear();
         nextCommandSeq = 0;
         state = SessionState::Running;
+    }
+
+    void rttSample(Peer& p, u32 echo) {
+        if (!echo) return;
+        const f32 sample = static_cast<f32>(toMs(now) - echo);
+        p.rttMs = p.rttMs == 0.0f ? sample : p.rttMs * 0.8f + sample * 0.2f;
     }
 
     bool finalize() {
@@ -307,6 +326,7 @@ struct LockstepSession::Impl {
             }
             ++finalNext;
         }
+        if (finalNext != before) lastFinalize = now;
         return finalNext != before;
     }
 
@@ -406,6 +426,7 @@ struct LockstepSession::Impl {
             entry.player = p.playerId;
             entry.name = displayName(p.name, p.playerId);
             entry.ready = p.ready;
+            entry.pingMs = static_cast<u32>(p.rttMs + 0.5f);
             entry.loadout = p.loadout;
             members.push_back(std::move(entry));
         }
@@ -428,20 +449,22 @@ struct LockstepSession::Impl {
     }
 
     // 로비 신호: 인원 + 사람마다 (번호, 준비, 이름, 로드아웃). 다 들어가지 않으면 다음 신호가 이어서 싣는다
-    void sendLobby(const Peer& p) {
+    void sendLobby(const Peer& p, Packet type = Packet::Lobby) {
         Writer w;
-        header(w, Packet::Lobby);
+        header(w, type);
         w.put(static_cast<u8>(members.size()));
         w.put(static_cast<u8>(maxPlayers));
         w.put(matchIndex);
+        w.put(toMs(now)); // 클라이언트가 접속 요청에 되돌려 준다 (로비에서도 왕복 시간)
         const u32 countAt = w.size;
         w.put(static_cast<u8>(0));
         u8 written = 0;
         for (u32 k = 0; k < members.size(); ++k) {
             const LobbyMember& entry = members[(memberCursor + k) % members.size()];
-            const u32 need = 4 + static_cast<u32>(entry.name.size()) + static_cast<u32>(entry.loadout.size()) + 1;
+            const u32 need = 6 + static_cast<u32>(entry.name.size()) + static_cast<u32>(entry.loadout.size()) + 1;
             if (w.size + need > kMaxPacket) break;
             w.put(entry.player);
+            w.put(static_cast<u16>(std::min<u32>(entry.pingMs, 0xFFFF)));
             w.put(static_cast<u8>((entry.ready ? kMemberReady : 0) | (entry.host ? kMemberHost : 0)));
             w.text(entry.name);
             w.put(static_cast<u8>(entry.loadout.size()));
@@ -477,6 +500,9 @@ struct LockstepSession::Impl {
         w.put(static_cast<u8>(desynced ? 1 : 0));
         w.put(desyncTick);
         w.put(p.commandNext);
+        w.put(toMs(now));
+        w.put(static_cast<u8>(waitMask));
+        for (u32 player = 0; player < playerCount; ++player) w.put(static_cast<u16>(std::min<u32>(playerPing[player], 0xFFFF)));
         const u32 first = p.bundleNext;
         const u32 perTick = playerCount * kInputBytes + 2; // + 명령 바이트 수
         const u32 available = finalNext > first ? std::min(finalNext - first, kMaxTicksPerPacket) : 0;
@@ -559,6 +585,7 @@ struct LockstepSession::Impl {
             r.bytes(loadout.data(), static_cast<u32>(loadout.size()));
             const u8 flags = r.get<u8>();
             std::string name = r.text(kMaxNameBytes);
+            const u32 hostEcho = r.get<u32>();
             if (!r.ok) return;
             if (build != buildId()) {
                 if (!acceptOtherBuilds) {
@@ -590,6 +617,7 @@ struct LockstepSession::Impl {
                 peer = findPeer(from);
                 MEALKIT_INFO("Player joined from %s (%zu/%u)", from.toString().c_str(), peers.size() + 1, maxPlayers);
             }
+            rttSample(*peer, hostEcho);
             if (state == SessionState::Lobby) { // 로비 신호마다 새 값
                 peer->loadout = std::move(loadout);
                 peer->name = std::move(name);
@@ -606,9 +634,11 @@ struct LockstepSession::Impl {
             const u32 echo = r.get<u32>();
             const u32 hashTick = r.get<u32>();
             const u64 hash = r.get<u64>();
+            const u32 hostEcho = r.get<u32>();
             const u32 first = r.get<u32>();
             const u8 count = r.get<u8>();
             if (!r.ok) return;
+            rttSample(*peer, hostEcho);
 
             peer->bundleNext = std::max(peer->bundleNext, std::min(bundleNext, finalNext));
             peer->echoTime = echo;
@@ -710,6 +740,14 @@ struct LockstepSession::Impl {
             return;
         }
         if (state != SessionState::Running) return;
+        playerPing[0] = 0;
+        for (const Peer& p : peers)
+            if (p.playerId < kMaxPlayers) playerPing[p.playerId] = static_cast<u32>(p.rttMs + 0.5f);
+        waitMask = 0;
+        if (now - lastFinalize > kStallReport) { // 확정이 멈췄다: 이 틱의 입력이 오지 않은 플레이어
+            const Slot& s = slot(finalNext);
+            waitMask = allMask() & ~(s.tick == finalNext ? s.mask : 0u);
+        }
         for (Peer& p : peers) {
             if (now - p.lastRecv > kTimeout) {
                 char reason[64];
@@ -719,6 +757,9 @@ struct LockstepSession::Impl {
             }
             if (!p.started && now - p.lastControlSend >= kStartResendInterval) {
                 sendStart(p);
+                p.lastControlSend = now;
+            } else if (p.started && now - p.lastControlSend >= kLobbyInterval) { // 매치 중 명단 (로비 신호 전에 시작한 사람도 이름을 안다)
+                sendLobby(p, Packet::Roster);
                 p.lastControlSend = now;
             }
             if (sendPending || now - p.lastSend >= kKeepAliveInterval) sendBundle(p);
@@ -738,6 +779,7 @@ struct LockstepSession::Impl {
         w.bytes(localLoadout.data(), static_cast<u32>(localLoadout.size()));
         w.put(static_cast<u8>(localReady ? kMemberReady : 0));
         w.text(localName);
+        w.put(peers[0].hostEcho);
         send(peers[0].address, w);
     }
 
@@ -750,6 +792,7 @@ struct LockstepSession::Impl {
         w.put(toMs(now));
         w.put(latestHashTick);
         w.put(latestHash);
+        w.put(h.hostEcho);
         const u32 first = hostInputAckNext;
         u32 count = localSubmittedNext > first ? localSubmittedNext - first : 0;
         count = std::min(count, kMaxTicksPerPacket);
@@ -817,23 +860,31 @@ struct LockstepSession::Impl {
             break;
         }
         case Packet::ConnectReject: end(rejectText(static_cast<Reject>(r.get<u8>()))); break;
-        case Packet::Lobby: {
+        case Packet::Lobby:
+        case Packet::Roster: {
             const u8 count = r.get<u8>();
             const u8 maxP = r.get<u8>();
             const u32 hostMatch = r.get<u32>();
+            const u32 hostTime = r.get<u32>();
             const u8 entries = r.get<u8>();
             if (!r.ok) return;
-            if (state == SessionState::Running) {
-                if (hostMatch < matchIndex) return; // 매치 시작 전에 보낸 늦은 신호
-                enterLobbyFromMatch();
+            h.hostEcho = hostTime;
+            if (type == Packet::Roster) { // 매치 중 명단: 이 매치의 것만
+                if (state != SessionState::Running || hostMatch != matchIndex) return;
+            } else {
+                if (state == SessionState::Running) {
+                    if (hostMatch < matchIndex) return; // 매치 시작 전에 보낸 늦은 신호
+                    enterLobbyFromMatch();
+                }
+                if (state != SessionState::Lobby) return;
+                matchIndex = std::max(matchIndex, hostMatch);
             }
-            if (state != SessionState::Lobby) return;
-            matchIndex = std::max(matchIndex, hostMatch);
             lobbyCount = count;
             maxPlayers = maxP;
             for (u32 i = 0; i < entries; ++i) {
                 LobbyMember entry;
                 entry.player = r.get<u8>();
+                entry.pingMs = r.get<u16>();
                 const u8 flags = r.get<u8>();
                 entry.name = r.text(kMaxNameBytes);
                 const u8 size = r.get<u8>();
@@ -903,10 +954,18 @@ struct LockstepSession::Impl {
             const u8 flags = r.get<u8>();
             const u32 hostDesyncTick = r.get<u32>();
             const u32 commandAck = r.get<u32>();
+            const u32 hostTime = r.get<u32>();
+            const u8 hostWait = r.get<u8>();
+            u32 pings[kMaxPlayers] = {};
+            for (u32 player = 0; player < playerCount; ++player) pings[player] = r.get<u16>();
             const u32 first = r.get<u32>();
             const u8 count = r.get<u8>();
             const u8 players = r.get<u8>();
             if (!r.ok || players != playerCount) return;
+            h.hostEcho = hostTime;
+            waitMask = hostWait;
+            lastBundle = now;
+            for (u32 player = 0; player < playerCount; ++player) playerPing[player] = pings[player];
 
             hostInputAckNext = std::max(hostInputAckNext, std::min(inputAckNext, localSubmittedNext));
             while (!outCommands.empty() && outCommands.front().seq < commandAck) outCommands.pop_front();
@@ -990,6 +1049,7 @@ struct LockstepSession::Impl {
             clientChat();
             return;
         }
+        if (state == SessionState::Running && now - lastBundle > kHostSilence) waitMask |= 1u; // 호스트에게서 아무것도 오지 않는다
         if (state == SessionState::Running && (sendPending || now - h.lastSend >= kKeepAliveInterval)) {
             sendInput();
             sendPending = false;
@@ -1302,5 +1362,15 @@ const std::vector<ChatMessage>& LockstepSession::chatLog() const { return m->cha
 bool LockstepSession::desynced() const { return m->desynced; }
 u32 LockstepSession::desyncTick() const { return m->desyncTick; }
 const SessionStats& LockstepSession::stats() const { return m->stats; }
+
+u32 LockstepSession::pingMs(u32 player) const {
+    if (player >= kMaxPlayers) return 0;
+    if (m->state == SessionState::Running) return m->playerPing[player];
+    for (const LobbyMember& member : m->members)
+        if (member.player == player) return member.pingMs;
+    return 0;
+}
+
+u32 LockstepSession::waitingFor() const { return m->state == SessionState::Running ? m->waitMask : 0u; }
 
 } // namespace mealkit::net
