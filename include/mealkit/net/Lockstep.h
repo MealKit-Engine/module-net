@@ -90,6 +90,17 @@ struct ChatMessage {
     std::string text;
 };
 
+// 입력 지연 자동 조절 (호스트): 매치 시작 때 로비에서 잰 왕복 시간으로 정하고, 매치 중에는 엔진 확정 명령으로 모두 같은 틱부터 1틱씩 바꾼다
+struct AutoDelay {
+    bool enabled = false;
+    f32 tickMs = 1000.0f / 30.0f; // 한 틱의 길이 (프로젝트 틱레이트)
+    u32 minTicks = 2;             // 같은 공유기에서도 이보다 짧게 하지 않는다
+    u32 maxTicks = 8;             // 이보다 먼 상대는 멈칫거린다 (로비가 경고한다)
+};
+
+// 이 왕복 시간(ms)에 맞는 입력 지연 (틱): 가장 먼 상대의 입력이 호스트를 거쳐 모두에게 닿을 시간 + 흔들림 여유 + 한 틱
+u32 delayForRtt(f32 rttMs, const AutoDelay& autoDelay);
+
 // 실행 파일마다 다른 값 (같은 빌드끼리만 접속한다: 결정론은 같은 기계어 코드를 전제로 한다)
 u32 buildId();
 
@@ -107,6 +118,10 @@ public:
     void setAcceptOtherBuilds(bool accept);
     // 네트워크 상태 흉내 (지연·흔들림·손실, mealkit/net/Conditions.h): host/join 전에. 시험용
     void setConditions(const NetConditions& conditions);
+    // 호스트: 입력 지연 자동 조절 (host의 inputDelay는 처음 값). 매치 중 바꾼 값은 inputDelay()
+    void setAutoDelay(const AutoDelay& autoDelay);
+    // 호스트, 매치 중: 입력 지연을 이 값으로 바꾸는 엔진 명령을 보낸다 (모두 같은 틱부터). 시험·게임 설정용
+    bool requestInputDelay(u32 ticks);
 
     // 혼자 플레이: 네트워크 없이 같은 코드 경로를 쓴다. startOffline은 바로 매치, openOffline은 로비부터(startMatch로 시작)
     bool startOffline(u64 seed, u32 matchData);

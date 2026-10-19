@@ -5,6 +5,7 @@
 #include "mealkit/core/Profile.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -24,6 +25,9 @@ constexpr f64 kChatResendInterval = 0.1;
 constexpr f64 kTimeout = 10.0;
 constexpr f64 kStallReport = 0.15;     // 이만큼 확정이 멈추면 누구를 기다리는지 알린다
 constexpr f64 kHostSilence = 0.3;      // 클라이언트: 호스트 묶음이 이만큼 없으면 호스트를 기다린다
+constexpr f64 kDelayCheckInterval = 1.0; // 호스트: 입력 지연을 다시 볼 간격
+constexpr f64 kDelayChangeInterval = 3.0; // 호스트: 입력 지연을 바꾼 뒤 다음 변경까지
+const u32 kDelayCommandType = static_cast<u32>(fnv1a("mealkit.net.InputDelay")); // 엔진 확정 명령 (게임 명령과 겹치지 않는 이름)
 constexpr u32 kMaxTicksPerPacket = 32;
 constexpr u32 kNoTick = 0xFFFFFFFFu;
 constexpr u32 kMaxPendingCommands = 256; // 호스트: 틱을 기다리는 명령
@@ -207,6 +211,10 @@ struct LockstepSession::Impl {
     u64 contentHash = 0;
     bool acceptOtherBuilds = false;
     NetConditions conditions;
+    AutoDelay autoDelay;
+    f64 lastDelayCheck = 0.0, lastDelayChange = 0.0;
+    bool delayChangePending = false; // 호스트: 보낸 지연 변경 명령이 아직 실행되지 않았다
+    PlayerInput lastLocalInput;      // 지연이 늘 때 빈 틱을 채운다
     u32 matchIndex = 0; // 시작한 매치 수 (호스트가 정하고 시작·로비 패킷으로 알린다)
 
     Slot slots[kTickWindow];
@@ -305,7 +313,66 @@ struct LockstepSession::Impl {
         outCommands.clear();
         pendingCommands.clear();
         nextCommandSeq = 0;
+        delayChangePending = false;
+        lastDelayChange = lastDelayCheck = now;
+        lastLocalInput = {};
         state = SessionState::Running;
+    }
+
+    u32 desiredDelay() const {
+        f32 worst = 0.0f;
+        for (const Peer& p : peers) worst = std::max(worst, p.rttMs);
+        return delayForRtt(worst, autoDelay);
+    }
+
+    // 호스트: 매치 중 왕복 시간이 바뀌면 지연을 바꾸는 엔진 명령을 보낸다 (늘릴 때는 필요한 만큼 바로, 줄일 때는 2틱 넘게 남을 때 1틱씩)
+    void adjustDelay() {
+        if (!autoDelay.enabled || offline || delayChangePending || now - lastDelayCheck < kDelayCheckInterval) return;
+        lastDelayCheck = now;
+        if (now - lastDelayChange < kDelayChangeInterval) return;
+        const u32 want = desiredDelay();
+        u32 next = inputDelay;
+        if (want > inputDelay) next = want; // 늘릴 때는 한 번에 (멈칫거림이 바로 사라진다)
+        else if (want + 2 <= inputDelay) next = inputDelay - 1;
+        if (next == inputDelay) return;
+        if (queueDelay(next)) lastDelayChange = now;
+    }
+
+    bool queueDelay(u32 next) {
+        if (!host || state != SessionState::Running || pendingCommands.size() >= kMaxPendingCommands) return false;
+        Command c;
+        c.player = localPlayer;
+        c.size = 5;
+        std::memcpy(c.data, &kDelayCommandType, 4);
+        c.data[4] = static_cast<u8>(std::clamp(next, 1u, 30u));
+        pendingCommands.push_back(c);
+        delayChangePending = true;
+        return true;
+    }
+
+    // 모든 피어가 같은 틱(지연 명령이 든 틱)을 실행한 직후 바꾼다. 다음 제출은 (tick + 새 지연)
+    void applyDelay(u32 tick, u32 next) {
+        next = std::clamp(next, 1u, 30u);
+        if (next == inputDelay) return;
+        MEALKIT_INFO("Input delay %u -> %u ticks from tick %u", inputDelay, next, tick);
+        // 늘면 (tick-1+예전)과 (tick+새) 사이가 빈다: 마지막 내 입력으로 채운다 (줄면 겹치는 틱은 submitLocalInput이 건너뛴다)
+        for (u32 t = tick + inputDelay; t < tick + next; ++t) {
+            if (host) {
+                Slot& s = claim(t);
+                const u32 bit = 1u << localPlayer;
+                if (!(s.mask & bit)) {
+                    s.inputs.players[localPlayer] = lastLocalInput;
+                    s.mask |= bit;
+                }
+            } else {
+                localInputs[t % kTickWindow] = lastLocalInput;
+                localSubmittedNext = std::max(localSubmittedNext, t + 1);
+            }
+        }
+        inputDelay = next;
+        delayChangePending = false;
+        if (host) finalize();
+        else sendPending = true;
     }
 
     void rttSample(Peer& p, u32 echo) {
@@ -740,6 +807,7 @@ struct LockstepSession::Impl {
             return;
         }
         if (state != SessionState::Running) return;
+        adjustDelay();
         playerPing[0] = 0;
         for (const Peer& p : peers)
             if (p.playerId < kMaxPlayers) playerPing[p.playerId] = static_cast<u32>(p.rttMs + 0.5f);
@@ -1069,6 +1137,15 @@ void LockstepSession::setContentHash(u64 hash) { m->contentHash = hash; }
 u64 LockstepSession::contentHash() const { return m->contentHash; }
 void LockstepSession::setAcceptOtherBuilds(bool accept) { m->acceptOtherBuilds = accept; }
 void LockstepSession::setConditions(const NetConditions& conditions) { m->conditions = conditions; }
+void LockstepSession::setAutoDelay(const AutoDelay& autoDelay) { m->autoDelay = autoDelay; }
+bool LockstepSession::requestInputDelay(u32 ticks) { return m->queueDelay(ticks); }
+
+u32 delayForRtt(f32 rttMs, const AutoDelay& a) {
+    const f32 tickMs = a.tickMs > 0.0f ? a.tickMs : 1000.0f / 30.0f;
+    const f32 needMs = rttMs * 1.25f + tickMs; // 왕복(호스트를 거친 가장 먼 길) + 흔들림 여유 + 처리 한 틱
+    const u32 ticks = static_cast<u32>(std::ceil(needMs / tickMs));
+    return std::clamp(ticks, std::max(1u, a.minTicks), std::max(a.minTicks, a.maxTicks));
+}
 
 bool LockstepSession::openOffline() {
     if (m->state != SessionState::Idle) return false;
@@ -1177,6 +1254,13 @@ void LockstepSession::startMatch(u64 seed, u32 matchData) {
     for (size_t i = 0; i < m->members.size(); ++i) m->members[i].player = static_cast<u8>(i);
     m->seed = seed;
     m->matchData = matchData;
+    if (m->autoDelay.enabled && !m->offline) { // 로비에서 잰 왕복 시간으로
+        m->inputDelay = m->desiredDelay();
+        MEALKIT_INFO("Input delay %u ticks (automatic, worst round trip %.0f ms)", m->inputDelay,
+                     m->peers.empty() ? 0.0 : static_cast<f64>(std::max_element(m->peers.begin(), m->peers.end(), [](const Peer& a, const Peer& b) {
+                                                   return a.rttMs < b.rttMs;
+                                               })->rttMs));
+    }
     ++m->matchIndex;
     for (size_t i = 0; i < m->peers.size(); ++i) {
         Peer& p = m->peers[i];
@@ -1267,6 +1351,7 @@ void LockstepSession::reset() {
     fresh->contentHash = m->contentHash;
     fresh->acceptOtherBuilds = m->acceptOtherBuilds;
     fresh->conditions = m->conditions;
+    fresh->autoDelay = m->autoDelay;
     fresh->localName = m->localName;
     fresh->localLoadout = m->localLoadout;
     delete m;
@@ -1296,6 +1381,11 @@ const TickInputs& LockstepSession::inputs(u32 tick) const { return m->slot(tick)
 
 void LockstepSession::tickExecuted(u32 tick, u64 stateHash) {
     m->executedNext = tick + 1;
+    forEachCommand(m->slot(tick).inputs, [&](u8, const u8* data, u32 size) { // 엔진 명령: 입력 지연 변경
+        u32 type = 0;
+        if (size == 5) std::memcpy(&type, data, 4);
+        if (size == 5 && type == kDelayCommandType) m->applyDelay(tick, data[4]);
+    });
     m->hashes[tick % kTickWindow] = {tick, stateHash};
     m->latestHashTick = tick;
     m->latestHash = stateHash;
@@ -1309,14 +1399,18 @@ void LockstepSession::tickExecuted(u32 tick, u64 stateHash) {
 
 void LockstepSession::submitLocalInput(u32 tick, const PlayerInput& input) {
     if (m->state != SessionState::Running) return;
+    m->lastLocalInput = input;
     if (m->host) {
+        if (tick < m->finalNext) return; // 지연이 줄어 이미 낸 틱 (확정된 것은 바꾸지 않는다)
         Slot& s = m->claim(tick);
+        if (s.mask & (1u << m->localPlayer)) return;
         s.inputs.players[m->localPlayer] = input;
         s.mask |= 1u << m->localPlayer;
         if (m->finalize() && !m->offline) {
             for (Peer& p : m->peers) m->sendBundle(p); // 확정되면 바로 배포 (지연 최소화)
         }
     } else {
+        if (tick < m->localSubmittedNext) return; // 지연이 줄어 이미 낸 틱
         m->localInputs[tick % kTickWindow] = input;
         m->localSubmittedNext = std::max(m->localSubmittedNext, tick + 1);
         m->sendInput();
