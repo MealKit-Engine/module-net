@@ -19,7 +19,7 @@ namespace mealkit::net {
 namespace {
 
 constexpr u32 kMagic = 0x52545341u; // "ASTR"
-constexpr u32 kMaxPacket = 1200;    // 인터넷 경로에서 쪼개지지 않는 안전한 크기
+constexpr u32 kMaxPacket = 1170;    // 인터넷 경로에서 쪼개지지 않는 크기이자 EOS P2P 상한 (EOS_P2P_MAX_PACKET_SIZE)
 constexpr f64 kKeepAliveInterval = 1.0 / 30.0;
 constexpr f64 kLobbyInterval = 0.5;
 constexpr f64 kConnectInterval = 0.25;
@@ -65,7 +65,7 @@ enum class Packet : u8 {
     Roster,    // 호스트 → 클라이언트: 매치 중 명단 (로비 신호와 같은 모양: 이름·핑, 로비로 돌아가지는 않는다)
     Snapshot,    // 호스트 → 중간 참가: 압축한 월드 스냅샷 조각 [매치][위치 u32][크기 u16][바이트]
     SnapshotAck, // 중간 참가 → 호스트: 처음부터 이어서 받은 바이트 수
-    Succession,  // 호스트 → 클라이언트: 승계 목록 [수 u8]{번호 u8, 연결 u8, 토큰 u64, 이름, ip u32, 포트 u16, steamId u64} (호스트 자신 먼저)
+    Succession,  // 호스트 → 클라이언트: 승계 목록 [수 u8]{번호 u8, 연결 u8, 토큰 u64, 이름, ip u32, 포트 u16, 사용자 id u64} (호스트 자신 먼저)
     Handoff,     // 호스트 → 클라이언트: 호스트가 나간다, 승계 목록대로 넘어가라 (Disconnect 대신)
     TickRequest, // 새 호스트 → 클라이언트: [매치][이 틱부터] 네가 가진 확정 틱을 보내라
     TickFill,    // 클라이언트 → 새 호스트: [매치][첫 틱 u32][수 u8] 틱마다 kMaxPlayers × 입력 + 명령
@@ -1123,7 +1123,7 @@ struct LockstepSession::Impl {
             w.text(name);
             w.put(a.ip);
             w.put(a.port);
-            w.put(a.steamId);
+            w.put(a.userId);
             ++count;
         };
         entry(localPlayer, true, localToken, localName, Address{});
@@ -1707,7 +1707,7 @@ struct LockstepSession::Impl {
                 e.name = r.text(kMaxNameBytes);
                 e.address.ip = r.get<u32>();
                 e.address.port = r.get<u16>();
-                e.address.steamId = r.get<u64>();
+                e.address.userId = r.get<u64>();
                 if (r.ok) list.push_back(std::move(e));
             }
             if (!r.ok || list.empty()) return;
