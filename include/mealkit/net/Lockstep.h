@@ -147,6 +147,12 @@ public:
     // 혼자 플레이: 네트워크 없이 같은 코드 경로를 쓴다. startOffline은 바로 매치, openOffline은 로비부터(startMatch로 시작)
     bool startOffline(u64 seed, u32 matchData);
     bool openOffline();
+    // 기록된 매치를 다시 돌린다 (네트워크 없음, Idle에서만). 바로 Running이 되고 canExecute는 기록된 틱까지만 참이다.
+    // 내 입력·명령은 버린다. hashes가 있으면 tickExecuted에서 비교해 처음 다른 틱을 디싱크로 알린다 (desynced/desyncTick)
+    bool startReplay(u64 seed, u32 matchData, const std::vector<std::vector<u8>>& loadouts,
+                     std::vector<TickInputs> inputs, std::vector<u64> hashes);
+    bool isReplay() const;
+    u32 replayTicks() const; // 기록된 틱 수 (리플레이가 아니면 0)
     // loopbackOnly: 같은 PC 테스트용 (방화벽 확인 창이 뜨지 않는다)
     bool host(u16 port, u32 maxPlayers, u32 inputDelay, bool loopbackOnly = false);
     bool join(const Address& hostAddress);

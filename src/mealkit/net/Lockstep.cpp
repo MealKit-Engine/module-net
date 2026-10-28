@@ -218,6 +218,9 @@ struct LockstepSession::Impl {
     std::string endReason;
     bool host = false;
     bool offline = false;
+    bool replay = false;               // startReplay: 입력은 replayInputs에서
+    std::vector<TickInputs> replayInputs;
+    std::vector<u64> replayHashes;     // replayInputs[t]를 실행한 뒤의 해시 (비어 있으면 비교하지 않는다)
     bool netStarted = false;
     std::unique_ptr<Transport> transport;
     std::vector<Peer> peers; // 호스트: 클라이언트들 (플레이어 번호 순) / 클라이언트: [0] = 호스트
@@ -1225,6 +1228,35 @@ bool LockstepSession::startOffline(u64 seed, u32 matchData) {
     return true;
 }
 
+bool LockstepSession::startReplay(u64 seed, u32 matchData, const std::vector<std::vector<u8>>& loadouts,
+                                  std::vector<TickInputs> inputs, std::vector<u64> hashes) {
+    if (m->state != SessionState::Idle) return false;
+    const u32 players = std::clamp(static_cast<u32>(loadouts.size()), 1u, kMaxPlayers);
+    m->offline = true;
+    m->host = true;
+    m->replay = true;
+    m->maxPlayers = m->playerCount = players;
+    m->localPlayer = 0;
+    m->inputDelay = 1;
+    m->seed = seed;
+    m->matchData = matchData;
+    for (std::vector<u8>& l : m->loadouts) l.clear();
+    for (u32 i = 0; i < players && i < loadouts.size(); ++i)
+        m->loadouts[i].assign(loadouts[i].begin(),
+                              loadouts[i].begin() + std::min<size_t>(loadouts[i].size(), kMaxLoadoutBytes));
+    m->replayInputs = std::move(inputs);
+    m->replayHashes = std::move(hashes);
+    m->rebuildMembers();
+    ++m->matchIndex;
+    m->beginRunning();
+    MEALKIT_INFO("Replaying a match: %u tick(s), %u player(s), seed %016llx", static_cast<u32>(m->replayInputs.size()),
+                 players, static_cast<unsigned long long>(seed));
+    return true;
+}
+
+bool LockstepSession::isReplay() const { return m->replay; }
+u32 LockstepSession::replayTicks() const { return m->replay ? static_cast<u32>(m->replayInputs.size()) : 0; }
+
 bool LockstepSession::host(u16 port, u32 maxPlayers, u32 inputDelay, bool loopbackOnly) {
     if (m->state != SessionState::Idle) return false;
     if (!startup()) return false;
@@ -1435,14 +1467,30 @@ u32 LockstepSession::matchData() const { return m->matchData; }
 u32 LockstepSession::inputDelay() const { return m->inputDelay; }
 
 bool LockstepSession::canExecute(u32 tick) const {
+    if (m->replay) return m->state == SessionState::Running && tick < m->replayInputs.size();
     const Slot& s = m->slot(tick);
     return m->state == SessionState::Running && s.tick == tick && s.complete;
 }
 
-const TickInputs& LockstepSession::inputs(u32 tick) const { return m->slot(tick).inputs; }
+const TickInputs& LockstepSession::inputs(u32 tick) const {
+    if (m->replay) return m->replayInputs[tick];
+    return m->slot(tick).inputs;
+}
 
 void LockstepSession::tickExecuted(u32 tick, u64 stateHash) {
     m->executedNext = tick + 1;
+    if (m->replay) {
+        m->latestHashTick = tick;
+        m->latestHash = stateHash;
+        if (tick < m->replayHashes.size() && m->replayHashes[tick] != stateHash && !m->desynced) {
+            m->desynced = true;
+            m->desyncTick = tick;
+            MEALKIT_ERROR("Replay diverged at tick %u: state hash %016llx, recorded %016llx (different build or data?)",
+                          tick, static_cast<unsigned long long>(stateHash),
+                          static_cast<unsigned long long>(m->replayHashes[tick]));
+        }
+        return;
+    }
     forEachCommand(m->slot(tick).inputs, [&](u8, const u8* data, u32 size) { // 엔진 명령: 입력 지연 변경
         u32 type = 0;
         if (size == 5) std::memcpy(&type, data, 4);
@@ -1460,7 +1508,7 @@ void LockstepSession::tickExecuted(u32 tick, u64 stateHash) {
 }
 
 void LockstepSession::submitLocalInput(u32 tick, const PlayerInput& input) {
-    if (m->state != SessionState::Running) return;
+    if (m->state != SessionState::Running || m->replay) return;
     m->lastLocalInput = input;
     if (m->host) {
         if (tick < m->finalNext) return; // 지연이 줄어 이미 낸 틱 (확정된 것은 바꾸지 않는다)
@@ -1480,7 +1528,7 @@ void LockstepSession::submitLocalInput(u32 tick, const PlayerInput& input) {
 }
 
 bool LockstepSession::submitCommand(const void* data, u32 size) {
-    if (m->state != SessionState::Running || size == 0 || size > kMaxCommandBytes) return false;
+    if (m->state != SessionState::Running || m->replay || size == 0 || size > kMaxCommandBytes) return false;
     Command c;
     c.size = static_cast<u8>(size);
     std::memcpy(c.data, data, size);
