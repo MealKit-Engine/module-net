@@ -23,6 +23,11 @@
 //
 // 세션 한 번에 매치를 여러 번 한다: 로비 → startMatch → 매치(Running) → returnToLobby → 로비 → ... (화면 흐름, game::MatchService).
 // 로비에서는 사람마다 이름·준비·로드아웃을 호스트가 모아 모두에게 보여 준다. 채팅은 틱 밖 메시지라 입력 기록에 들어가지 않는다.
+//
+// 중간 참가·재접속: 매치 중에 누가 끊기면 매치는 계속되고 그 슬롯의 입력은 빈 입력이 된다. 다시 들어오면(같은 세션 토큰이나 이름)
+// 그 슬롯을, 처음 들어온 사람은 빈 슬롯을 받는다. 호스트는 게임(game::Simulation)에게 지금 틱의 월드 스냅샷을 받아(snapshotWanted →
+// provideSnapshot) LZ4로 압축해 나눠 보내고, 들어온 사람은 그 틱부터 확정된 입력으로 빨리 감아 따라잡는다(catchingUp). 다른 사람은 멈추지 않는다.
+// 접속·끊김은 엔진 확정 명령(kPresenceCommand)으로 모두 같은 틱에 시뮬레이션에 알린다(sim::readPresence).
 namespace mealkit::net {
 
 inline constexpr u32 kMaxPlayers = 8;
@@ -35,6 +40,8 @@ inline constexpr u32 kMaxNameBytes = 24;         // 로비에 보이는 플레�
 inline constexpr u32 kMaxChatBytes = 120;        // 채팅 한 줄 (UTF-8)
 inline constexpr u32 kChatLogSize = 50;          // chatLog()가 남기는 줄 수
 inline constexpr f64 kChatInterval = 0.5;        // 내 채팅 한 줄 사이 최소 간격 (초)
+// 엔진 확정 명령 이름 (명령 타입 = 이름의 fnv1a): 플레이어 접속·끊김. 내용 [접속 u8][로드아웃 바이트], 보낸 플레이어 = 그 슬롯
+inline constexpr const char* kPresenceCommand = "mealkit.net.Presence";
 
 struct PlayerInput {
     u8 bytes[kInputBytes] = {};
@@ -198,6 +205,17 @@ public:
     const TickInputs& inputs(u32 tick) const;
     // 틱 T를 실행한 직후 호출한다.
     void tickExecuted(u32 tick, u64 stateHash);
+    // 매치 중 접속해 있는 플레이어 (비트 = 플레이어 번호, 실행한 틱 기준: 접속·끊김 명령을 실행하면 바뀐다)
+    u32 connectedMask() const;
+
+    // 중간 참가 (호스트): 들어오는 사람에게 보낼 스냅샷이 필요하다. 게임이 틱 사이에 provideSnapshot(다음에 실행할 틱, 바이트)으로 준다
+    bool snapshotWanted() const;
+    void provideSnapshot(u32 tick, const std::vector<u8>& bytes);
+    // 중간 참가 (클라이언트): Running이 된 첫 틱 (처음부터 시작했으면 0). 스냅샷 바이트는 게임이 한 번 가져간다
+    u32 joinTick() const;
+    bool takeJoinSnapshot(std::vector<u8>& out);
+    // 들어온 뒤 확정된 틱을 따라잡는 중: 게임은 한 프레임에 많이 돌리고, 내 입력은 따라잡은 뒤부터 보낸다
+    bool catchingUp() const;
     // 로컬 입력을 (실행한 틱 + inputDelay) 틱용으로 제출한다.
     void submitLocalInput(u32 tick, const PlayerInput& input);
     // 확정 명령을 보낸다 (Running일 때만, 크기 1..kMaxCommandBytes). 호스트가 다음에 확정하는 틱에 들어간다. 대기열이 차면 false.

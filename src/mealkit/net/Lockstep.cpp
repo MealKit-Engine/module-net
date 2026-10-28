@@ -1,5 +1,6 @@
 #include "mealkit/net/Lockstep.h"
 
+#include "mealkit/core/Compress.h"
 #include "mealkit/core/Hash.h"
 #include "mealkit/core/Log.h"
 #include "mealkit/core/Profile.h"
@@ -9,6 +10,8 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -28,6 +31,12 @@ constexpr f64 kHostSilence = 0.3;      // 클라이언트: 호스트 묶음이 �
 constexpr f64 kDelayCheckInterval = 1.0; // 호스트: 입력 지연을 다시 볼 간격
 constexpr f64 kDelayChangeInterval = 3.0; // 호스트: 입력 지연을 바꾼 뒤 다음 변경까지
 const u32 kDelayCommandType = static_cast<u32>(fnv1a("mealkit.net.InputDelay")); // 엔진 확정 명령 (게임 명령과 겹치지 않는 이름)
+const u32 kPresenceCommandType = static_cast<u32>(fnv1a(kPresenceCommand)); // 접속·끊김 (Lockstep.h)
+constexpr u32 kSnapshotChunk = 1100;      // 스냅샷 패킷 하나의 데이터 (머리를 더해 kMaxPacket 안)
+constexpr u32 kSnapshotWindow = 32 * kSnapshotChunk; // 확인받지 않고 보내 두는 양
+constexpr f64 kSnapshotResend = 0.25;     // 확인이 이만큼 나아가지 않으면 확인받은 곳부터 다시
+constexpr u32 kCaughtUpTicks = 2;
+constexpr f64 kStaleConnection = 1.0;     // 호스트: 이만큼 소식이 없는 연결은 같은 이름의 재접속이 대신한다         // 클라이언트: 확정된 끝에서 이만큼 안이면 따라잡았다
 constexpr u32 kMaxTicksPerPacket = 32;
 constexpr u32 kNoTick = 0xFFFFFFFFu;
 constexpr u32 kMaxPendingCommands = 256; // 호스트: 틱을 기다리는 명령
@@ -47,6 +56,8 @@ enum class Packet : u8 {
     Chat,      // 클라이언트 → 호스트: 보낼 채팅 + 받은 채팅 확인
     ChatRelay, // 호스트 → 클라이언트: 모두의 채팅 + 보낸 채팅 확인
     Roster,    // 호스트 → 클라이언트: 매치 중 명단 (로비 신호와 같은 모양: 이름·핑, 로비로 돌아가지는 않는다)
+    Snapshot,    // 호스트 → 중간 참가: 압축한 월드 스냅샷 조각 [매치][위치 u32][크기 u16][바이트]
+    SnapshotAck, // 중간 참가 → 호스트: 처음부터 이어서 받은 바이트 수
 };
 using Reject = RejectReason;
 
@@ -158,7 +169,25 @@ struct Peer {
     u32 chatNext = 0;           // 호스트: 이 클라이언트에게서 받은 채팅의 다음 번호
     u32 relayNext = 0;          // 호스트: 이 클라이언트가 확인한 중계 채팅의 다음 번호
     bool chatAckDirty = false;  // 호스트: 받은 채팅을 확인해 줘야 한다
+    u64 token = 0;              // 호스트: 이 클라이언트의 세션 토큰 (재접속 때 같은 슬롯을 찾는다)
+    // 호스트, 중간 참가: 스냅샷을 받는 중(late && !started)이거나 확정된 틱을 따라잡는 중(catchUp)
+    bool late = false;
+    bool catchUp = false;
+    std::shared_ptr<const std::vector<u8>> snapshot; // 압축한 스냅샷 (provideSnapshot 뒤)
+    u32 snapshotTick = kNoTick;
+    u32 snapshotRaw = 0;        // 압축 전 크기
+    u32 snapshotCount = 0;      // 스냅샷 틱의 참가 인원·접속 (시작 패킷에 싣는다)
+    u32 snapshotConnected = 0;
+    u32 snapshotAcked = 0, snapshotSent = 0;
+    f64 snapshotProgress = 0.0;
     HashEntry reported[kTickWindow];
+};
+
+// 호스트: 매치 중에 끊긴 사람 (다시 들어오면 같은 슬롯)
+struct Departed {
+    u8 playerId = 0;
+    u64 token = 0;
+    std::string name;
 };
 
 struct Command {
@@ -284,6 +313,25 @@ struct LockstepSession::Impl {
     std::deque<RelayChat> relayLog; // 호스트
     u32 relayEnd = 0;               // 호스트: 다음 중계 번호
 
+    // 중간 참가·재접속
+    u64 localToken = 0;                 // 이 세션 객체의 토큰 (reset 뒤에도 남는다)
+    u32 connected = 0;                  // 실행한 틱 기준 접속 비트
+    u32 requiredFrom[kMaxPlayers] = {}; // 호스트: 이 틱부터 이 플레이어의 입력을 기다린다 (kNoTick: 기다리지 않는다, 빈 입력)
+    u32 width = 1;                      // 호스트: 묶음에 싣는 플레이어 수 (쓴 적 있는 가장 큰 번호 + 1)
+    std::vector<Departed> departed;     // 호스트
+    bool snapshotWanted = false;        // 호스트: 게임에게 스냅샷을 달라고 한다
+    std::deque<TickInputs> joinLog;     // 호스트: 따라잡는 사람에게 보낼 확정 틱 (링 버퍼에서 밀려난 것까지)
+    u32 joinLogBase = 0;
+    bool joinLogging = false;
+    bool late = false;                  // 클라이언트: 매치 중에 들어왔다
+    u32 joinTick = 0;                   // 클라이언트: 스냅샷의 틱 (처음부터면 0)
+    u32 joinRaw = 0, joinCompressed = 0;
+    std::vector<u8> joinBuffer;         // 클라이언트: 받는 중인 압축 스냅샷 (전체 크기, 조각은 순서 없이 채운다)
+    std::vector<bool> joinChunks;       // 클라이언트: 받은 조각
+    u32 joinPrefix = 0;                 // 클라이언트: 처음부터 빠짐없이 받은 바이트 (호스트에게 확인)
+    std::vector<u8> joinSnapshot;       // 클라이언트: 푼 스냅샷 (게임이 가져간다)
+    bool catchingUp = false;            // 클라이언트
+
     HashEntry hashes[kTickWindow];
     u32 latestHashTick = kNoTick;
     u64 latestHash = 0;
@@ -298,6 +346,13 @@ struct LockstepSession::Impl {
     u64 recvBytes = 0;
 
     u32 allMask() const { return (1u << playerCount) - 1u; }
+    // 호스트: 이 틱을 확정하려면 입력이 있어야 하는 플레이어 (끊긴 사람·아직 따라잡는 사람은 빈 입력)
+    u32 needMask(u32 tick) const {
+        u32 mask = 0;
+        for (u32 player = 0; player < kMaxPlayers; ++player)
+            if (requiredFrom[player] <= tick) mask |= 1u << player;
+        return mask;
+    }
     Slot& slot(u32 tick) { return slots[tick % kTickWindow]; }
     const Slot& slot(u32 tick) const { return slots[tick % kTickWindow]; }
     u8 matchByte() const { return static_cast<u8>(matchIndex); } // 입력·묶음 패킷: 지난 매치의 늦은 패킷을 버린다
@@ -315,7 +370,8 @@ struct LockstepSession::Impl {
     u32 windowLow() const {
         u32 low = executedNext;
         if (host)
-            for (const Peer& p : peers) low = std::min(low, p.bundleNext);
+            for (const Peer& p : peers)
+                if (!(p.late && !p.started) && !p.catchUp) low = std::min(low, p.bundleNext); // 들어오는 사람은 joinLog에서 받는다
         return low;
     }
     bool inWindow(u32 tick) const { return tick + 1 < windowLow() + kTickWindow; }
@@ -330,6 +386,13 @@ struct LockstepSession::Impl {
             s.complete = true;
         }
         finalNext = inputDelay;
+        for (u32 player = 0; player < kMaxPlayers; ++player) requiredFrom[player] = player < playerCount ? 0 : kNoTick;
+        width = playerCount;
+        connected = allMask();
+        departed.clear();
+        joinLog.clear();
+        joinLogging = false;
+        snapshotWanted = false;
         lastFinalize = lastBundle = now;
         waitMask = 0;
         executedNext = 0;
@@ -415,10 +478,12 @@ struct LockstepSession::Impl {
             Slot& s = slot(finalNext);
             if (s.tick != finalNext) break;
             if (!s.complete) {
-                if ((s.mask & allMask()) != allMask()) break;
+                const u32 need = host ? needMask(finalNext) : allMask();
+                if ((s.mask & need) != need) break;
                 if (host) packCommands(s.inputs);
                 s.complete = true;
             }
+            if (host && joinLogging && joinLogBase + joinLog.size() == finalNext) joinLog.push_back(s.inputs);
             ++finalNext;
         }
         if (finalNext != before) lastFinalize = now;
@@ -446,6 +511,49 @@ struct LockstepSession::Impl {
         for (size_t i = 0; i < pendingCommands.size(); ++i)
             if (!taken[i]) pendingCommands[keep++] = pendingCommands[i];
         pendingCommands.resize(keep);
+    }
+
+    // 호스트: 접속·끊김 엔진 명령 (보낸 플레이어 = 그 슬롯). 모두 같은 틱에 applyPresence와 시뮬레이션이 처리한다
+    void queuePresence(u8 player, bool isConnected, const std::vector<u8>& loadout) {
+        Command c;
+        c.player = player;
+        std::memcpy(c.data, &kPresenceCommandType, 4);
+        c.data[4] = isConnected ? 1 : 0;
+        const u32 n = std::min<u32>(static_cast<u32>(loadout.size()), kMaxCommandBytes - 5);
+        if (n) std::memcpy(c.data + 5, loadout.data(), n);
+        c.size = static_cast<u8>(5 + n);
+        pendingCommands.push_back(c);
+    }
+
+    void applyPresence(u8 player, bool isConnected, const u8* loadout, u32 size) {
+        if (player >= kMaxPlayers) return;
+        if (isConnected) {
+            connected |= 1u << player;
+            playerCount = std::max(playerCount, player + 1u);
+            if (size) loadouts[player].assign(loadout, loadout + std::min(size, kMaxLoadoutBytes));
+        } else {
+            connected &= ~(1u << player);
+        }
+        if (host) width = std::max(width, playerCount);
+    }
+
+    // 확정된 틱의 입력: 링 버퍼, 이미 밀려났으면 joinLog
+    const TickInputs* finalized(u32 tick) const {
+        const Slot& s = slot(tick);
+        if (s.tick == tick && s.complete) return &s.inputs;
+        if (tick >= joinLogBase && tick - joinLogBase < joinLog.size()) return &joinLog[tick - joinLogBase];
+        return nullptr;
+    }
+
+    // 호스트, 매치 중: 끊긴 사람은 빼고 계속한다 (그 슬롯은 빈 입력, 다시 들어오면 같은 슬롯)
+    void dropPeer(size_t index, const char* why) {
+        const Peer& p = peers[index];
+        MEALKIT_WARN("Player %u %s - the match goes on without them", p.playerId, why);
+        requiredFrom[p.playerId] = kNoTick;
+        departed.push_back({p.playerId, p.token, p.name});
+        queuePresence(p.playerId, false, {});
+        peers.erase(peers.begin() + static_cast<std::ptrdiff_t>(index));
+        if (finalize()) sendPending = true;
     }
 
     void send(const Address& to, const Writer& w) {
@@ -502,6 +610,7 @@ struct LockstepSession::Impl {
         for (u8 id = 1; id < kMaxPlayers; ++id) {
             bool used = false;
             for (const Peer& p : peers) used = used || p.playerId == id;
+            for (const Departed& d : departed) used = used || d.playerId == id;
             if (!used) return id;
         }
         return 0;
@@ -533,6 +642,7 @@ struct LockstepSession::Impl {
         header(w, Packet::ConnectAccept);
         w.put(p.playerId);
         w.put(static_cast<u8>(maxPlayers));
+        w.put(static_cast<u8>(state == SessionState::Running ? 1 : 0)); // 매치 중: 로비로 가지 않고 스냅샷을 기다린다
         send(p.address, w);
     }
 
@@ -578,15 +688,23 @@ struct LockstepSession::Impl {
     void sendStart(const Peer& p) {
         Writer w;
         header(w, Packet::Start);
+        const u32 count = p.late ? p.snapshotCount : playerCount;
         w.put(p.playerId);
-        w.put(static_cast<u8>(playerCount));
+        w.put(static_cast<u8>(count));
         w.put(static_cast<u8>(inputDelay));
         w.put(seed);
         w.put(matchData);
         w.put(matchIndex);
-        for (u32 i = 0; i < playerCount; ++i) {
+        for (u32 i = 0; i < count; ++i) {
             w.put(static_cast<u8>(loadouts[i].size()));
             w.bytes(loadouts[i].data(), static_cast<u32>(loadouts[i].size()));
+        }
+        w.put(static_cast<u8>(p.late ? 1 : 0));
+        if (p.late) { // 중간 참가: 스냅샷의 틱·크기, 그 틱의 접속
+            w.put(p.snapshotTick);
+            w.put(p.snapshotRaw);
+            w.put(static_cast<u32>(p.snapshot->size()));
+            w.put(p.snapshotConnected);
         }
         send(p.address, w);
     }
@@ -602,26 +720,25 @@ struct LockstepSession::Impl {
         w.put(p.commandNext);
         w.put(toMs(now));
         w.put(static_cast<u8>(waitMask));
-        for (u32 player = 0; player < playerCount; ++player) w.put(static_cast<u16>(std::min<u32>(playerPing[player], 0xFFFF)));
+        w.put(static_cast<u8>(width));
+        for (u32 player = 0; player < width; ++player) w.put(static_cast<u16>(std::min<u32>(playerPing[player], 0xFFFF)));
         const u32 first = p.bundleNext;
-        const u32 perTick = playerCount * kInputBytes + 2; // + 명령 바이트 수
+        const u32 perTick = width * kInputBytes + 2; // + 명령 바이트 수
         const u32 available = finalNext > first ? std::min(finalNext - first, kMaxTicksPerPacket) : 0;
-        u32 count = 0, bytes = w.size + 4 + 2;
+        u32 count = 0, bytes = w.size + 4 + 1;
         while (count < available) { // 명령이 있는 틱은 커서 패킷에 들어가는 만큼만
-            const u32 need = perTick + slot(first + count).inputs.commandBytes;
-            if (bytes + need > kMaxPacket) break;
-            bytes += need;
+            const TickInputs* in = finalized(first + count);
+            if (!in || bytes + perTick + in->commandBytes > kMaxPacket) break;
+            bytes += perTick + in->commandBytes;
             ++count;
         }
         w.put(first);
         w.put(static_cast<u8>(count));
-        w.put(static_cast<u8>(playerCount));
         for (u32 i = 0; i < count; ++i) {
-            const Slot& s = slot(first + i);
-            MEALKIT_ASSERT(s.tick == first + i && s.complete);
-            for (u32 player = 0; player < playerCount; ++player) w.bytes(s.inputs.players[player].bytes, kInputBytes);
-            w.put(s.inputs.commandBytes);
-            w.bytes(s.inputs.commands, s.inputs.commandBytes);
+            const TickInputs& in = *finalized(first + i);
+            for (u32 player = 0; player < width; ++player) w.bytes(in.players[player].bytes, kInputBytes);
+            w.put(in.commandBytes);
+            w.bytes(in.commands, in.commandBytes);
         }
         send(p.address, w);
         p.lastSend = now;
@@ -672,6 +789,74 @@ struct LockstepSession::Impl {
         }
     }
 
+    // 매치 중 접속: 끊긴 사람(같은 토큰, 아니면 같은 이름)은 그 슬롯, 아니면 빈 슬롯. 스냅샷은 게임에게 달라고 하고 다음 update부터 보낸다
+    Peer* acceptLate(const Address& from, u64 token, const std::string& name, const std::vector<u8>& loadout) {
+        // 같은 사람이 새 주소로 (네트워크가 바뀌었다, 또는 끊김을 알리지 못하고 나갔다가 다시 켰다): 예전 연결을 끊은 셈 친다.
+        // 토큰이 같거나, 같은 이름인데 예전 연결이 조용하다
+        for (size_t i = 0; i < peers.size(); ++i)
+            if ((token != 0 && peers[i].token == token) ||
+                (!name.empty() && peers[i].name == name && now - peers[i].lastRecv > kStaleConnection)) {
+                dropPeer(i, "reconnected");
+                break;
+            }
+        size_t found = departed.size();
+        for (size_t i = 0; i < departed.size() && found == departed.size(); ++i)
+            if (token != 0 && departed[i].token == token) found = i;
+        for (size_t i = 0; i < departed.size() && found == departed.size(); ++i)
+            if (!name.empty() && departed[i].name == name) found = i;
+        u8 id = 0;
+        if (found < departed.size()) {
+            id = departed[found].playerId;
+            departed.erase(departed.begin() + static_cast<std::ptrdiff_t>(found));
+        } else {
+            if (1 + peers.size() + departed.size() >= maxPlayers) {
+                sendReject(from, Reject::Full);
+                return nullptr;
+            }
+            id = freePlayerId();
+        }
+        const bool rejoin = id < playerCount;
+        Peer p;
+        p.address = from;
+        p.playerId = id;
+        p.lastRecv = now;
+        p.relayNext = relayEnd;
+        p.token = token;
+        p.name = name;
+        p.loadout = loadout;
+        p.late = true;
+        peers.push_back(std::move(p));
+        std::sort(peers.begin(), peers.end(), [](const Peer& a, const Peer& b) { return a.playerId < b.playerId; });
+        width = std::max(width, id + 1u);
+        queuePresence(id, true, loadout);
+        snapshotWanted = true;
+        MEALKIT_INFO("Player %u %s the match from %s (tick %u)", id, rejoin ? "rejoined" : "joined", from.toString().c_str(),
+                     executedNext);
+        return findPeer(from);
+    }
+
+    // 호스트 → 중간 참가: 확인받지 않은 스냅샷 조각을 창 크기만큼. 확인이 멈추면 확인받은 곳부터 다시
+    void sendSnapshot(Peer& p) {
+        const std::vector<u8>& data = *p.snapshot;
+        const u32 size = static_cast<u32>(data.size());
+        if (p.snapshotAcked >= size) return;
+        if (now - p.snapshotProgress > kSnapshotResend) {
+            p.snapshotSent = p.snapshotAcked;
+            p.snapshotProgress = now;
+        }
+        while (p.snapshotSent < size && p.snapshotSent - p.snapshotAcked < kSnapshotWindow) {
+            const u32 n = std::min(kSnapshotChunk, size - p.snapshotSent);
+            Writer w;
+            header(w, Packet::Snapshot);
+            w.put(matchByte());
+            w.put(p.snapshotSent);
+            w.put(static_cast<u16>(n));
+            w.bytes(data.data() + p.snapshotSent, n);
+            send(p.address, w);
+            p.snapshotSent += n;
+        }
+    }
+
     void hostReceive(const Address& from, Reader& r, Packet type) {
         Peer* peer = findPeer(from);
         if (peer) peer->lastRecv = now;
@@ -690,6 +875,7 @@ struct LockstepSession::Impl {
             const u8 flags = r.get<u8>();
             std::string name = r.text(kMaxNameBytes);
             const u32 hostEcho = r.get<u32>();
+            const u64 token = r.get<u64>();
             if (!r.ok) return;
             // 같은 시뮬레이션이어야 한다: 결정론 그룹(컴파일러·CPU) → 시뮬레이션 버전(게임 버전 + 시뮬레이션 소스) → 게임 데이터
             if (group != determinismGroup() || build != mySimVersion()) {
@@ -706,6 +892,10 @@ struct LockstepSession::Impl {
                 sendReject(from, Reject::Content, mask);
                 return;
             }
+            if (!peer && state == SessionState::Running) {
+                peer = acceptLate(from, token, name, loadout);
+                if (!peer) return;
+            }
             if (!peer) {
                 if (state != SessionState::Lobby) {
                     sendReject(from, Reject::InProgress);
@@ -720,6 +910,7 @@ struct LockstepSession::Impl {
                 p.playerId = freePlayerId();
                 p.lastRecv = now;
                 p.relayNext = relayEnd; // 들어오기 전의 채팅은 보내지 않는다
+                p.token = token;
                 peers.push_back(p);
                 std::sort(peers.begin(), peers.end(), [](const Peer& a, const Peer& b) { return a.playerId < b.playerId; });
                 peer = findPeer(from);
@@ -747,6 +938,11 @@ struct LockstepSession::Impl {
             const u8 count = r.get<u8>();
             if (!r.ok) return;
             rttSample(*peer, hostEcho);
+            if (requiredFrom[peer->playerId] == kNoTick && count > 0) { // 중간 참가·재접속: 따라잡고 처음 낸 입력부터 기다린다
+                requiredFrom[peer->playerId] = std::max(first, finalNext);
+                peer->inputNext = requiredFrom[peer->playerId];
+                MEALKIT_INFO("Player %u is caught up: inputs from tick %u", peer->playerId, peer->inputNext);
+            }
 
             peer->bundleNext = std::max(peer->bundleNext, std::min(bundleNext, finalNext));
             peer->echoTime = echo;
@@ -810,12 +1006,21 @@ struct LockstepSession::Impl {
             }
             break;
         }
+        case Packet::SnapshotAck: {
+            const u32 received = r.get<u32>();
+            if (!peer || !r.ok || !peer->snapshot) return;
+            const u32 acked = std::min(received, static_cast<u32>(peer->snapshot->size()));
+            if (acked > peer->snapshotAcked) {
+                peer->snapshotAcked = acked;
+                peer->snapshotSent = std::max(peer->snapshotSent, acked);
+                peer->snapshotProgress = now;
+            }
+            break;
+        }
         case Packet::Disconnect: {
             if (!peer) return;
             if (state == SessionState::Running) {
-                char reason[64];
-                snprintf(reason, sizeof(reason), "Player %u left the match", peer->playerId);
-                end(reason);
+                dropPeer(static_cast<size_t>(peer - peers.data()), "left");
             } else {
                 MEALKIT_INFO("Player left the lobby (%s)", from.toString().c_str());
                 peers.erase(peers.begin() + (peer - peers.data()));
@@ -855,15 +1060,27 @@ struct LockstepSession::Impl {
         waitMask = 0;
         if (now - lastFinalize > kStallReport) { // 확정이 멈췄다: 이 틱의 입력이 오지 않은 플레이어
             const Slot& s = slot(finalNext);
-            waitMask = allMask() & ~(s.tick == finalNext ? s.mask : 0u);
+            waitMask = needMask(finalNext) & ~(s.tick == finalNext ? s.mask : 0u);
         }
+        for (size_t i = 0; i < peers.size();) {
+            if (now - peers[i].lastRecv > kTimeout) dropPeer(i, "timed out");
+            else ++i;
+        }
+        bool logNeeded = false;
         for (Peer& p : peers) {
-            if (now - p.lastRecv > kTimeout) {
-                char reason[64];
-                snprintf(reason, sizeof(reason), "Player %u timed out", p.playerId);
-                end(reason);
-                return;
+            if (p.late && !p.started) { // 중간 참가: 스냅샷이 준비되면 시작 패킷과 스냅샷 조각
+                if (p.snapshot) {
+                    if (now - p.lastControlSend >= kStartResendInterval) {
+                        sendStart(p);
+                        p.lastControlSend = now;
+                    }
+                    sendSnapshot(p);
+                }
+                logNeeded = true;
+                continue;
             }
+            if (p.catchUp && finalNext - p.bundleNext < kTickWindow / 2) p.catchUp = false; // 이제 링 버퍼에 있다
+            logNeeded = logNeeded || p.catchUp;
             if (!p.started && now - p.lastControlSend >= kStartResendInterval) {
                 sendStart(p);
                 p.lastControlSend = now;
@@ -873,8 +1090,25 @@ struct LockstepSession::Impl {
             }
             if (sendPending || now - p.lastSend >= kKeepAliveInterval) sendBundle(p);
         }
+        trimJoinLog(logNeeded);
         sendPending = false;
         hostChat();
+    }
+
+    // 따라잡는 사람이 모두 받은 틱은 버린다. 아무도 없으면 그만 남긴다
+    void trimJoinLog(bool needed) {
+        if (!needed) {
+            joinLog.clear();
+            joinLogging = false;
+            return;
+        }
+        u32 low = finalNext;
+        for (const Peer& p : peers)
+            if ((p.late && !p.started && p.snapshot) || p.catchUp) low = std::min(low, p.bundleNext);
+        while (!joinLog.empty() && joinLogBase < low) {
+            joinLog.pop_front();
+            ++joinLogBase;
+        }
     }
 
     // ---------------- 클라이언트 ----------------
@@ -892,6 +1126,7 @@ struct LockstepSession::Impl {
         w.put(static_cast<u8>(localReady ? kMemberReady : 0));
         w.text(localName);
         w.put(peers[0].hostEcho);
+        w.put(localToken);
         send(peers[0].address, w);
     }
 
@@ -962,7 +1197,15 @@ struct LockstepSession::Impl {
         case Packet::ConnectAccept: {
             const u8 id = r.get<u8>();
             const u8 maxP = r.get<u8>();
+            const u8 inMatch = r.get<u8>();
             if (!r.ok) return;
+            if (state == SessionState::Connecting && inMatch) { // 매치 중: 스냅샷을 받을 때까지 접속 중으로 남는다
+                if (!late) MEALKIT_INFO("Connected to %s - the match is running, waiting for its snapshot", from.toString().c_str());
+                late = true;
+                localPlayer = id;
+                maxPlayers = maxP;
+                break;
+            }
             if (state == SessionState::Connecting) {
                 state = SessionState::Lobby;
                 MEALKIT_INFO("Connected to %s - waiting for the host to start", from.toString().c_str());
@@ -1049,13 +1292,39 @@ struct LockstepSession::Impl {
             const u32 index = r.get<u32>();
             if (!r.ok || state == SessionState::Running || state == SessionState::Ended) return;
             if (index <= matchIndex && matchIndex != 0) return; // 지난 매치의 늦은 시작 패킷
-            if (count == 0 || count > kMaxPlayers || id >= count || delay == 0) return;
+            if (count == 0 || count > kMaxPlayers || id >= kMaxPlayers || delay == 0) return;
+            std::vector<u8> startLoadouts[kMaxPlayers];
             for (u32 i = 0; i < count; ++i) {
                 const u8 size = r.get<u8>();
-                loadouts[i].resize(std::min<u32>(size, kMaxLoadoutBytes));
-                r.bytes(loadouts[i].data(), static_cast<u32>(loadouts[i].size()));
+                startLoadouts[i].resize(std::min<u32>(size, kMaxLoadoutBytes));
+                r.bytes(startLoadouts[i].data(), static_cast<u32>(startLoadouts[i].size()));
             }
-            if (!r.ok) return;
+            const u8 lateStart = r.get<u8>();
+            if (!r.ok || (!lateStart && id >= count)) return;
+            for (u32 i = 0; i < kMaxPlayers; ++i) loadouts[i] = std::move(startLoadouts[i]);
+            if (lateStart) { // 중간 참가: 스냅샷 조각을 기다린다 (다 받으면 startLate)
+                const u32 snapshotTick = r.get<u32>();
+                const u32 raw = r.get<u32>();
+                const u32 compressed = r.get<u32>();
+                const u32 connectedAt = r.get<u32>();
+                if (!r.ok || state != SessionState::Connecting || joinCompressed != 0 || compressed == 0) return;
+                localPlayer = id;
+                playerCount = count;
+                inputDelay = delay;
+                seed = matchSeed;
+                matchData = data;
+                matchIndex = index;
+                joinTick = snapshotTick;
+                joinRaw = raw;
+                joinCompressed = compressed;
+                joinBuffer.assign(compressed, 0);
+                joinChunks.assign((compressed + kSnapshotChunk - 1) / kSnapshotChunk, false);
+                joinPrefix = 0;
+                connected = connectedAt;
+                MEALKIT_INFO("Joining the running match at tick %u: snapshot %u bytes (%u compressed)", snapshotTick, raw,
+                             compressed);
+                break;
+            }
             localPlayer = id;
             playerCount = count;
             inputDelay = delay;
@@ -1078,16 +1347,17 @@ struct LockstepSession::Impl {
             const u32 commandAck = r.get<u32>();
             const u32 hostTime = r.get<u32>();
             const u8 hostWait = r.get<u8>();
+            const u8 players = r.get<u8>(); // 호스트가 싣는 플레이어 수 (중간 참가로 늘 수 있다)
+            if (!r.ok || players == 0 || players > kMaxPlayers) return;
             u32 pings[kMaxPlayers] = {};
-            for (u32 player = 0; player < playerCount; ++player) pings[player] = r.get<u16>();
+            for (u32 player = 0; player < players; ++player) pings[player] = r.get<u16>();
             const u32 first = r.get<u32>();
             const u8 count = r.get<u8>();
-            const u8 players = r.get<u8>();
-            if (!r.ok || players != playerCount) return;
+            if (!r.ok) return;
             h.hostEcho = hostTime;
             waitMask = hostWait;
             lastBundle = now;
-            for (u32 player = 0; player < playerCount; ++player) playerPing[player] = pings[player];
+            for (u32 player = 0; player < players; ++player) playerPing[player] = pings[player];
 
             hostInputAckNext = std::max(hostInputAckNext, std::min(inputAckNext, localSubmittedNext));
             while (!outCommands.empty() && outCommands.front().seq < commandAck) outCommands.pop_front();
@@ -1143,9 +1413,53 @@ struct LockstepSession::Impl {
             relayAckDirty = true;
             break;
         }
+        case Packet::Snapshot: {
+            const u8 match = r.get<u8>();
+            const u32 offset = r.get<u32>();
+            const u16 size = r.get<u16>();
+            if (!r.ok || state != SessionState::Connecting || joinCompressed == 0 || match != matchByte()) return;
+            const u32 chunk = offset / kSnapshotChunk; // 순서가 바뀌어 와도 받아 둔다 (빠진 것은 호스트가 다시 보낸다)
+            if (offset % kSnapshotChunk != 0 || chunk >= joinChunks.size() ||
+                size != std::min(kSnapshotChunk, joinCompressed - offset))
+                return;
+            if (!joinChunks[chunk]) {
+                r.bytes(joinBuffer.data() + offset, size);
+                if (!r.ok) return;
+                joinChunks[chunk] = true;
+                while (joinPrefix < joinCompressed && joinChunks[joinPrefix / kSnapshotChunk])
+                    joinPrefix = std::min(joinPrefix + kSnapshotChunk, joinCompressed);
+            }
+            Writer w;
+            header(w, Packet::SnapshotAck);
+            w.put(joinPrefix);
+            send(h.address, w);
+            if (joinPrefix == joinCompressed) startLate();
+            break;
+        }
         case Packet::Disconnect: end("Host closed the session"); break;
         default: break;
         }
+    }
+
+    // 스냅샷을 다 받았다: 그 틱부터 확정된 입력을 받아 따라잡는다 (게임은 takeJoinSnapshot으로 월드를 불러온다)
+    void startLate() {
+        if (!decompressBytes(joinBuffer.data(), static_cast<u32>(joinBuffer.size()), joinRaw, joinSnapshot)) {
+            end("The match snapshot from the host was damaged");
+            return;
+        }
+        joinBuffer = {};
+        joinChunks = {};
+        const u32 connectedAt = connected;
+        const u32 count = playerCount;
+        beginRunning();
+        for (Slot& s : slots) s = Slot{};
+        connected = connectedAt;
+        playerCount = count;
+        finalNext = executedNext = joinTick;
+        localSubmittedNext = hostInputAckNext = joinTick;
+        catchingUp = true;
+        MEALKIT_INFO("Match snapshot received: catching up from tick %u as player %u", joinTick, localPlayer);
+        sendInput(); // 시작 확인 (호스트가 묶음을 보내기 시작한다)
     }
 
     void clientUpdate() {
@@ -1180,7 +1494,15 @@ struct LockstepSession::Impl {
     }
 };
 
-LockstepSession::LockstepSession() : m(new Impl()) {}
+namespace {
+u64 newToken() {
+    std::random_device device;
+    const u64 token = (static_cast<u64>(device()) << 32) ^ device();
+    return token ? token : 1;
+}
+} // namespace
+
+LockstepSession::LockstepSession() : m(new Impl()) { m->localToken = newToken(); }
 
 LockstepSession::~LockstepSession() {
     shutdown();
@@ -1362,6 +1684,8 @@ void LockstepSession::startMatch(u64 seed, u32 matchData) {
         p.bundleNext = m->inputDelay;
         p.echoTime = 0;
         p.commandNext = 0;
+        p.late = p.catchUp = false;
+        p.snapshot.reset();
         for (HashEntry& e : p.reported) e = HashEntry{};
     }
     m->beginRunning();
@@ -1448,6 +1772,7 @@ void LockstepSession::reset() {
     fresh->autoDelay = m->autoDelay;
     fresh->localName = m->localName;
     fresh->localLoadout = m->localLoadout;
+    fresh->localToken = m->localToken; // 같은 사람: 다시 들어가면 예전 슬롯
     delete m;
     m = fresh;
 }
@@ -1491,11 +1816,17 @@ void LockstepSession::tickExecuted(u32 tick, u64 stateHash) {
         }
         return;
     }
-    forEachCommand(m->slot(tick).inputs, [&](u8, const u8* data, u32 size) { // 엔진 명령: 입력 지연 변경
+    forEachCommand(m->slot(tick).inputs, [&](u8 player, const u8* data, u32 size) { // 엔진 명령: 입력 지연 변경, 접속·끊김
         u32 type = 0;
-        if (size == 5) std::memcpy(&type, data, 4);
+        if (size >= 5) std::memcpy(&type, data, 4);
         if (size == 5 && type == kDelayCommandType) m->applyDelay(tick, data[4]);
+        if (size >= 5 && type == kPresenceCommandType) m->applyPresence(player, data[4] != 0, data + 5, size - 5);
     });
+    if (m->catchingUp && tick + 1 + kCaughtUpTicks >= m->finalNext) { // 따라잡았다: 다음 내 입력부터 보낸다
+        m->catchingUp = false;
+        m->localSubmittedNext = m->hostInputAckNext = tick + m->inputDelay;
+        MEALKIT_INFO("Caught up with the match at tick %u", tick);
+    }
     m->hashes[tick % kTickWindow] = {tick, stateHash};
     m->latestHashTick = tick;
     m->latestHash = stateHash;
@@ -1508,7 +1839,7 @@ void LockstepSession::tickExecuted(u32 tick, u64 stateHash) {
 }
 
 void LockstepSession::submitLocalInput(u32 tick, const PlayerInput& input) {
-    if (m->state != SessionState::Running || m->replay) return;
+    if (m->state != SessionState::Running || m->replay || m->catchingUp) return;
     m->lastLocalInput = input;
     if (m->host) {
         if (tick < m->finalNext) return; // 지연이 줄어 이미 낸 틱 (확정된 것은 바꾸지 않는다)
@@ -1526,6 +1857,56 @@ void LockstepSession::submitLocalInput(u32 tick, const PlayerInput& input) {
         m->sendInput();
     }
 }
+
+u32 LockstepSession::connectedMask() const { return m->connected; }
+
+bool LockstepSession::snapshotWanted() const { return m->host && m->state == SessionState::Running && m->snapshotWanted; }
+
+void LockstepSession::provideSnapshot(u32 tick, const std::vector<u8>& bytes) {
+    if (!snapshotWanted() || tick != m->executedNext || tick > m->finalNext) return;
+    m->snapshotWanted = false;
+    auto compressed = std::make_shared<const std::vector<u8>>(compressBytes(bytes.data(), static_cast<u32>(bytes.size())));
+    if (compressed->empty()) {
+        MEALKIT_ERROR("Could not compress the join snapshot");
+        return;
+    }
+    // 따라잡을 확정 틱: 스냅샷 틱부터 (링 버퍼에 아직 있다)
+    if (!m->joinLogging || tick < m->joinLogBase) {
+        m->joinLog.clear();
+        m->joinLogBase = tick;
+        for (u32 t = tick; t < m->finalNext; ++t) m->joinLog.push_back(m->slot(t).inputs);
+        m->joinLogging = true;
+    }
+    for (Peer& p : m->peers) {
+        if (!p.late || p.started || p.snapshot) continue;
+        p.snapshot = compressed;
+        p.snapshotTick = tick;
+        p.snapshotRaw = static_cast<u32>(bytes.size());
+        p.snapshotCount = m->playerCount;
+        p.snapshotConnected = m->connected;
+        p.snapshotAcked = p.snapshotSent = 0;
+        p.snapshotProgress = m->now;
+        p.bundleNext = tick;
+        p.inputNext = 0;
+        p.commandNext = 0;
+        p.echoTime = 0;
+        p.catchUp = true;
+        p.lastControlSend = -1.0;
+        for (HashEntry& e : p.reported) e = HashEntry{};
+    }
+    MEALKIT_INFO("Join snapshot at tick %u: %zu bytes, %zu compressed", tick, bytes.size(), compressed->size());
+}
+
+u32 LockstepSession::joinTick() const { return m->joinTick; }
+
+bool LockstepSession::takeJoinSnapshot(std::vector<u8>& out) {
+    if (m->joinSnapshot.empty()) return false;
+    out = std::move(m->joinSnapshot);
+    m->joinSnapshot = {};
+    return true;
+}
+
+bool LockstepSession::catchingUp() const { return m->catchingUp; }
 
 bool LockstepSession::submitCommand(const void* data, u32 size) {
     if (m->state != SessionState::Running || m->replay || size == 0 || size > kMaxCommandBytes) return false;
