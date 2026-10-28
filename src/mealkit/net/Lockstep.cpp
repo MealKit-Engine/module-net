@@ -43,6 +43,13 @@ constexpr u32 kMaxPendingCommands = 256; // 호스트: 틱을 기다리는 명�
 constexpr u32 kMaxOutCommands = 64;      // 클라이언트: 호스트가 확인하지 않은 명령
 constexpr u32 kMaxOutChat = 16;          // 클라이언트: 호스트가 확인하지 않은 채팅
 constexpr u32 kMaxRelayLog = 64;         // 호스트: 아직 모두가 확인하지 않은 채팅
+// 호스트 이전 (docs/DECISIONS.md 2026-10-28)
+constexpr f64 kSuccessionInterval = 1.0; // 호스트: 승계 목록을 보내는 간격
+constexpr f64 kHostLost = 3.0;           // 클라이언트: 매치가 흐르는 중 호스트가 이만큼 조용하면 승계자에게 넘어간다 (로비·로딩은 kTimeout)
+constexpr f64 kMigrateHold = 1.0;        // 새 호스트: 다른 피어의 더 앞선 확정 틱을 기다리는 시간 (그동안 스스로 확정하지 않는다)
+constexpr f64 kTickRequestInterval = 0.1;
+constexpr f64 kUpdateGap = 0.5;          // 클라이언트: update 사이가 이보다 길면 (내가 멈춰 있었다) 그동안은 침묵으로 세지 않는다
+constexpr u32 kUnknownSeq = 0xFFFFFFFFu; // 새 호스트: 이 피어의 명령·채팅 번호를 아직 모른다 (처음 받은 것부터)
 
 enum class Packet : u8 {
     ConnectRequest = 1,
@@ -58,6 +65,10 @@ enum class Packet : u8 {
     Roster,    // 호스트 → 클라이언트: 매치 중 명단 (로비 신호와 같은 모양: 이름·핑, 로비로 돌아가지는 않는다)
     Snapshot,    // 호스트 → 중간 참가: 압축한 월드 스냅샷 조각 [매치][위치 u32][크기 u16][바이트]
     SnapshotAck, // 중간 참가 → 호스트: 처음부터 이어서 받은 바이트 수
+    Succession,  // 호스트 → 클라이언트: 승계 목록 [수 u8]{번호 u8, 연결 u8, 토큰 u64, 이름, ip u32, 포트 u16, steamId u64} (호스트 자신 먼저)
+    Handoff,     // 호스트 → 클라이언트: 호스트가 나간다, 승계 목록대로 넘어가라 (Disconnect 대신)
+    TickRequest, // 새 호스트 → 클라이언트: [매치][이 틱부터] 네가 가진 확정 틱을 보내라
+    TickFill,    // 클라이언트 → 새 호스트: [매치][첫 틱 u32][수 u8] 틱마다 kMaxPlayers × 입력 + 명령
 };
 using Reject = RejectReason;
 
@@ -181,6 +192,18 @@ struct Peer {
     u32 snapshotAcked = 0, snapshotSent = 0;
     f64 snapshotProgress = 0.0;
     HashEntry reported[kTickWindow];
+    // 새 호스트: 호스트 이전 뒤 이 피어에게서 소식을 들었다, 그 피어가 가진 확정 틱의 끝
+    bool heard = true;
+    u32 clientFinal = 0;
+};
+
+// 승계 목록 한 줄 (호스트 이전)
+struct Successor {
+    u8 player = 0;
+    bool connected = true;
+    u64 token = 0;
+    std::string name;
+    Address address;
 };
 
 // 호스트: 매치 중에 끊긴 사람 (다시 들어오면 같은 슬롯)
@@ -332,6 +355,16 @@ struct LockstepSession::Impl {
     std::vector<u8> joinSnapshot;       // 클라이언트: 푼 스냅샷 (게임이 가져간다)
     bool catchingUp = false;            // 클라이언트
 
+    // 호스트 이전
+    u8 hostPlayer = 0;                  // 지금 호스트의 플레이어 번호
+    std::vector<Successor> successors;  // 클라이언트: 호스트가 마지막으로 보낸 승계 목록 (호스트 자신 포함, 보낸 순서)
+    f64 lastSuccession = -1.0;          // 호스트
+    f64 migrateHold = 0.0;              // 새 호스트: 이 시각까지 앞선 확정 틱을 기다린다 (0 = 끝)
+    f64 lastTickRequest = -1.0;         // 새 호스트
+    f64 lastUpdate = -1.0;              // 클라이언트: 지난 update 시각
+    bool matchFlowing = false;          // 클라이언트: 이번 매치에서 묶음에 틱이 실려 왔다 (짧은 호스트 판정을 쓴다)
+    u32 migrations = 0;
+
     HashEntry hashes[kTickWindow];
     u32 latestHashTick = kNoTick;
     u64 latestHash = 0;
@@ -407,6 +440,9 @@ struct LockstepSession::Impl {
         delayChangePending = false;
         lastDelayChange = lastDelayCheck = now;
         lastLocalInput = {};
+        matchFlowing = false;
+        migrateHold = 0.0;
+        lastSuccession = -1.0; // 매치 번호로 다시 매긴 목록을 바로 보낸다
         state = SessionState::Running;
     }
 
@@ -478,6 +514,7 @@ struct LockstepSession::Impl {
             Slot& s = slot(finalNext);
             if (s.tick != finalNext) break;
             if (!s.complete) {
+                if (host && holding()) break; // 새 호스트: 앞선 확정 틱이 올 수 있다 (스스로 정하면 갈라진다)
                 const u32 need = host ? needMask(finalNext) : allMask();
                 if ((s.mask & need) != need) break;
                 if (host) packCommands(s.inputs);
@@ -488,6 +525,19 @@ struct LockstepSession::Impl {
         }
         if (finalNext != before) lastFinalize = now;
         return finalNext != before;
+    }
+
+    // 새 호스트: 다른 피어가 더 앞선 확정 틱을 가졌을 수 있다. 모두에게서 소식을 듣고 그 틱을 다 받거나 kMigrateHold가 지나면 끝
+    bool holding() {
+        if (migrateHold == 0.0) return false;
+        bool wait = false;
+        for (const Peer& p : peers) wait = wait || !p.heard || p.clientFinal > finalNext;
+        if (!wait || now >= migrateHold) {
+            migrateHold = 0.0;
+            MEALKIT_INFO("Host migration: continuing from tick %u", finalNext);
+            return false;
+        }
+        return true;
     }
 
     // 호스트: 기다리던 명령을 이 틱에 싣는다. 플레이어 번호 → 받은 순서, 넘치면 그 플레이어의 나머지는 다음 틱 (순서 유지)
@@ -607,8 +657,8 @@ struct LockstepSession::Impl {
 
     // 비어 있는 가장 작은 플레이어 번호 (로비에서 나간 사람의 번호를 다시 쓴다)
     u8 freePlayerId() const {
-        for (u8 id = 1; id < kMaxPlayers; ++id) {
-            bool used = false;
+        for (u8 id = 0; id < kMaxPlayers; ++id) {
+            bool used = id == localPlayer;
             for (const Peer& p : peers) used = used || p.playerId == id;
             for (const Departed& d : departed) used = used || d.playerId == id;
             if (!used) return id;
@@ -619,8 +669,8 @@ struct LockstepSession::Impl {
     void rebuildMembers() {
         members.clear();
         LobbyMember self;
-        self.player = 0;
-        self.name = displayName(localName, 0);
+        self.player = localPlayer; // 이어받은 호스트는 0이 아닐 수 있다
+        self.name = displayName(localName, localPlayer);
         self.ready = true; // 호스트는 시작하는 사람
         self.host = true;
         self.loadout = localLoadout;
@@ -938,6 +988,9 @@ struct LockstepSession::Impl {
             const u8 count = r.get<u8>();
             if (!r.ok) return;
             rttSample(*peer, hostEcho);
+            if (!peer->heard) peer->bundleNext = std::min(bundleNext, finalNext); // 호스트 이전 뒤 처음: 이 피어가 가진 끝부터 보낸다
+            peer->heard = true;
+            peer->clientFinal = bundleNext;
             if (requiredFrom[peer->playerId] == kNoTick && count > 0) { // 중간 참가·재접속: 따라잡고 처음 낸 입력부터 기다린다
                 requiredFrom[peer->playerId] = std::max(first, finalNext);
                 peer->inputNext = requiredFrom[peer->playerId];
@@ -966,6 +1019,7 @@ struct LockstepSession::Impl {
             }
             const u32 commandFirst = r.get<u32>();
             const u8 commandCount = r.get<u8>();
+            if (r.ok && peer->commandNext == kUnknownSeq) peer->commandNext = commandFirst; // 호스트 이전 뒤 처음
             for (u32 i = 0; r.ok && i < commandCount; ++i) {
                 Command c;
                 c.size = r.get<u8>();
@@ -994,6 +1048,7 @@ struct LockstepSession::Impl {
             const u8 count = r.get<u8>();
             if (!r.ok) return;
             peer->relayNext = std::max(peer->relayNext, std::min(relayAck, relayEnd));
+            if (peer->chatNext == kUnknownSeq) peer->chatNext = firstSeq; // 호스트 이전 뒤 처음
             for (u32 i = 0; i < count; ++i) {
                 const std::string text = r.text(kMaxChatBytes);
                 if (!r.ok) break;
@@ -1004,6 +1059,28 @@ struct LockstepSession::Impl {
                 peer->chatAckDirty = true;
                 if (!text.empty()) relayChat(peer->playerId, displayName(peer->name, peer->playerId), text);
             }
+            break;
+        }
+        case Packet::TickFill: { // 호스트 이전: 옛 호스트가 확정했지만 내가 받지 못한 틱
+            if (!peer || state != SessionState::Running || r.get<u8>() != matchByte()) return;
+            const u32 first = r.get<u32>();
+            const u8 count = r.get<u8>();
+            for (u32 i = 0; r.ok && i < count; ++i) {
+                TickInputs in{};
+                for (u32 player = 0; player < kMaxPlayers; ++player) r.bytes(in.players[player].bytes, kInputBytes);
+                in.commandBytes = r.get<u16>();
+                if (in.commandBytes > kCommandBytesPerTick) break;
+                r.bytes(in.commands, in.commandBytes);
+                if (!r.ok) break;
+                const u32 t = first + i;
+                if (t < finalNext || !inWindow(t)) continue;
+                Slot& s = claim(t);
+                s.inputs = in; // 옛 호스트가 정한 것이 맞다 (내가 채운 내 입력도 같은 값이다)
+                s.mask = ~0u;
+                s.complete = true;
+            }
+            lastTickRequest = -1.0;
+            if (finalize()) sendPending = true;
             break;
         }
         case Packet::SnapshotAck: {
@@ -1031,8 +1108,50 @@ struct LockstepSession::Impl {
         }
     }
 
+    // 호스트 → 클라이언트: 승계 목록 (나, 그다음 연결된 클라이언트와 매치 중 끊긴 사람, 슬롯 순). 다 들어가지 않으면 앞쪽만
+    void sendSuccession() {
+        Writer w;
+        header(w, Packet::Succession);
+        const u32 countAt = w.size;
+        w.put(static_cast<u8>(0));
+        u8 count = 0;
+        auto entry = [&](u8 player, bool isConnected, u64 token, const std::string& name, const Address& a) {
+            if (w.size + 1 + 1 + 8 + 1 + name.size() + 4 + 2 + 8 > kMaxPacket) return;
+            w.put(player);
+            w.put(static_cast<u8>(isConnected ? 1 : 0));
+            w.put(token);
+            w.text(name);
+            w.put(a.ip);
+            w.put(a.port);
+            w.put(a.steamId);
+            ++count;
+        };
+        entry(localPlayer, true, localToken, localName, Address{});
+        for (const Peer& p : peers) entry(p.playerId, true, p.token, p.name, p.address);
+        for (const Departed& d : departed) entry(d.playerId, false, d.token, d.name, Address{});
+        w.data[countAt] = count;
+        for (const Peer& p : peers) send(p.address, w);
+        lastSuccession = now;
+    }
+
+    // 새 호스트: 가장 앞선 확정 틱을 가진 피어에게 모자란 틱을 달라고 한다
+    void requestTicks() {
+        if (migrateHold == 0.0 || now - lastTickRequest < kTickRequestInterval) return;
+        const Peer* best = nullptr;
+        for (const Peer& p : peers)
+            if (p.heard && p.clientFinal > finalNext && (!best || p.clientFinal > best->clientFinal)) best = &p;
+        if (!best) return;
+        Writer w;
+        header(w, Packet::TickRequest);
+        w.put(matchByte());
+        w.put(finalNext);
+        send(best->address, w);
+        lastTickRequest = now;
+    }
+
     void hostUpdate() {
         rebuildMembers();
+        if (!peers.empty() && now - lastSuccession >= kSuccessionInterval) sendSuccession();
         if (state == SessionState::Lobby) {
             bool sentLobby = false;
             for (size_t i = 0; i < peers.size();) {
@@ -1053,8 +1172,11 @@ struct LockstepSession::Impl {
             return;
         }
         if (state != SessionState::Running) return;
+        requestTicks();
+        if (holding()) lastFinalize = now; // 기다리는 동안은 멈춤으로 알리지 않는다
+        else if (finalize()) sendPending = true;
         adjustDelay();
-        playerPing[0] = 0;
+        playerPing[localPlayer] = 0;
         for (const Peer& p : peers)
             if (p.playerId < kMaxPlayers) playerPing[p.playerId] = static_cast<u32>(p.rttMs + 0.5f);
         waitMask = 0;
@@ -1188,9 +1310,144 @@ struct LockstepSession::Impl {
         MEALKIT_INFO("Back to the lobby (match %u ended)", matchIndex);
     }
 
-    void clientReceive(const Address& from, Reader& r, Packet type) {
+    // ---------------- 호스트 이전 ----------------
+
+    // 승계 목록에서 다음 호스트: 지금 호스트를 뺀 첫 연결자
+    const Successor* nextHost() const {
+        for (const Successor& e : successors)
+            if (e.connected && e.player != hostPlayer) return &e;
+        return nullptr;
+    }
+
+    bool canMigrate() const {
+        return !offline && !replay && !late && !catchingUp &&
+               (state == SessionState::Lobby || state == SessionState::Running) && nextHost() != nullptr;
+    }
+
+    // 호스트가 나갔다·조용하다: 승계 목록의 다음 사람에게 붙거나 내가 호스트가 된다
+    void migrate(const char* why) {
+        if (!canMigrate()) {
+            end("Connection to the host was lost");
+            return;
+        }
+        for (Successor& e : successors)
+            if (e.player == hostPlayer) e.connected = false; // 옛 호스트: 끊긴 사람 (같은 토큰으로 다시 들어오면 그 슬롯)
+        const Successor next = *nextHost();
+        ++migrations;
+        MEALKIT_WARN("Host player %u %s - player %u takes over the session (tick %u)", hostPlayer, why, next.player, finalNext);
+        const u8 oldHost = hostPlayer;
+        hostPlayer = next.player;
+        relayStarted = false; // 새 호스트의 중계 번호는 0부터
+        if (next.player == localPlayer) {
+            becomeHost(oldHost);
+            return;
+        }
         Peer& h = peers[0];
-        if (!(from == h.address)) return;
+        h = Peer{};
+        h.address = next.address;
+        h.lastRecv = now;
+        lastBundle = now;
+        matchFlowing = false; // 새 호스트가 틱을 보내기 시작할 때까지는 긴 판정
+        if (state == SessionState::Running) {
+            hostInputAckNext = std::min(hostInputAckNext, finalNext); // 옛 호스트가 받고 확정하지 못한 내 입력은 다시 보낸다
+            sendInput();
+        } else {
+            sendConnect();
+        }
+    }
+
+    void becomeHost(u8 oldHost) {
+        host = true;
+        std::vector<Peer> next;
+        departed.clear();
+        for (const Successor& e : successors) {
+            if (e.player == localPlayer) continue;
+            if (!e.connected) {
+                departed.push_back({e.player, e.token, e.name});
+                continue;
+            }
+            Peer p;
+            p.address = e.address;
+            p.playerId = e.player;
+            p.token = e.token;
+            p.name = e.name;
+            p.lastRecv = now;
+            p.started = state == SessionState::Running;
+            p.inputNext = p.bundleNext = finalNext;
+            p.commandNext = p.chatNext = kUnknownSeq;
+            p.heard = false;
+            for (const LobbyMember& member : members)
+                if (member.player == e.player) p.loadout = member.loadout;
+            next.push_back(std::move(p));
+        }
+        peers = std::move(next);
+        relayLog.clear();
+        relayEnd = 0;
+        pendingCommands.clear();
+        if (state == SessionState::Running) {
+            // 앞으로 기다릴 입력: 목록의 연결자와 나. 그 밖(옛 호스트, 목록 뒤에 들어온 사람)은 빈 입력 (다시 들어오면 그 슬롯)
+            for (u32 player = 0; player < kMaxPlayers; ++player) requiredFrom[player] = kNoTick;
+            requiredFrom[localPlayer] = finalNext;
+            for (const Peer& p : peers) requiredFrom[p.playerId] = finalNext;
+            width = playerCount;
+            for (u32 player = 0; player < kMaxPlayers; ++player)
+                if (requiredFrom[player] != kNoTick) width = std::max(width, player + 1);
+            // 내가 낸 입력 중 아직 확정되지 않은 것
+            for (u32 t = finalNext; t < localSubmittedNext; ++t) {
+                Slot& pending = claim(t);
+                pending.inputs.players[localPlayer] = localInputs[t % kTickWindow];
+                pending.mask |= 1u << localPlayer;
+            }
+            for (u32 player = 0; player < kMaxPlayers; ++player)
+                if (requiredFrom[player] == kNoTick && (connected & (1u << player)))
+                    queuePresence(static_cast<u8>(player), false, {});
+            joinLog.clear();
+            joinLogging = false;
+            snapshotWanted = false;
+            delayChangePending = false;
+            migrateHold = now + kMigrateHold;
+            lastTickRequest = -1.0;
+            lastFinalize = now;
+        }
+        rebuildMembers();
+        sendSuccession();
+        MEALKIT_INFO("This peer is the host now (player %u, %zu client(s), old host %u)", localPlayer, peers.size(), oldHost);
+    }
+
+    // 클라이언트 → 새 호스트: 가진 확정 틱 (from부터, 패킷에 들어가는 만큼)
+    void sendTickFill(u32 from) {
+        if (from >= finalNext) return;
+        Writer w;
+        header(w, Packet::TickFill);
+        w.put(matchByte());
+        w.put(from);
+        const u32 countAt = w.size;
+        w.put(static_cast<u8>(0));
+        u8 count = 0;
+        for (u32 t = from; t < finalNext && count < kMaxTicksPerPacket; ++t) {
+            const Slot& s = slot(t);
+            if (s.tick != t || !s.complete) break;
+            if (w.size + kMaxPlayers * kInputBytes + 2 + s.inputs.commandBytes > kMaxPacket) break;
+            for (u32 player = 0; player < kMaxPlayers; ++player) w.bytes(s.inputs.players[player].bytes, kInputBytes);
+            w.put(s.inputs.commandBytes);
+            w.bytes(s.inputs.commands, s.inputs.commandBytes);
+            ++count;
+        }
+        w.data[countAt] = count;
+        send(peers[0].address, w);
+    }
+
+    void clientReceive(const Address& from, Reader& r, Packet type) {
+        if (!(from == peers[0].address)) {
+            // 승계자가 먼저 호스트가 되어 보낸다 (Handoff를 놓쳤다): 바로 넘어간다
+            const Successor* next = nextHost();
+            const bool fromHost = type == Packet::Bundle || type == Packet::Succession || type == Packet::TickRequest ||
+                                  type == Packet::Lobby || type == Packet::Roster;
+            if (!fromHost || !next || next->player == localPlayer || !(next->address == from) || !canMigrate()) return;
+            migrate("was replaced");
+            if (host || !(from == peers[0].address)) return;
+        }
+        Peer& h = peers[0];
         h.lastRecv = now;
 
         switch (type) {
@@ -1357,6 +1614,7 @@ struct LockstepSession::Impl {
             h.hostEcho = hostTime;
             waitMask = hostWait;
             lastBundle = now;
+            if (count > 0) matchFlowing = true;
             for (u32 player = 0; player < players; ++player) playerPing[player] = pings[player];
 
             hostInputAckNext = std::max(hostInputAckNext, std::min(inputAckNext, localSubmittedNext));
@@ -1437,6 +1695,33 @@ struct LockstepSession::Impl {
             break;
         }
         case Packet::Disconnect: end("Host closed the session"); break;
+        case Packet::Handoff: migrate("left"); break;
+        case Packet::Succession: {
+            const u8 count = r.get<u8>();
+            std::vector<Successor> list;
+            for (u32 i = 0; r.ok && i < count; ++i) {
+                Successor e;
+                e.player = r.get<u8>();
+                e.connected = r.get<u8>() != 0;
+                e.token = r.get<u64>();
+                e.name = r.text(kMaxNameBytes);
+                e.address.ip = r.get<u32>();
+                e.address.port = r.get<u16>();
+                e.address.steamId = r.get<u64>();
+                if (r.ok) list.push_back(std::move(e));
+            }
+            if (!r.ok || list.empty()) return;
+            hostPlayer = list[0].player; // 호스트 자신이 먼저
+            list[0].address = h.address;
+            successors = std::move(list);
+            break;
+        }
+        case Packet::TickRequest: {
+            if (state != SessionState::Running || r.get<u8>() != matchByte()) return;
+            const u32 fromTick = r.get<u32>();
+            if (r.ok) sendTickFill(fromTick);
+            break;
+        }
         default: break;
         }
     }
@@ -1465,6 +1750,11 @@ struct LockstepSession::Impl {
     void clientUpdate() {
         Peer& h = peers[0];
         if (h.lastRecv < 0.0) h.lastRecv = now;
+        if (lastUpdate >= 0.0 && now - lastUpdate > kUpdateGap) { // 내가 멈춰 있었다 (로딩): 그동안은 호스트 침묵으로 세지 않는다
+            h.lastRecv += now - lastUpdate;
+            lastBundle += now - lastUpdate;
+        }
+        lastUpdate = now;
         if (state == SessionState::Connecting) {
             if (now - h.lastControlSend >= kConnectInterval) {
                 sendConnect();
@@ -1473,9 +1763,11 @@ struct LockstepSession::Impl {
             if (now - h.lastRecv > kTimeout) end("Could not reach the host");
             return;
         }
-        if (now - h.lastRecv > kTimeout) {
-            end("Connection to the host was lost");
-            return;
+        // 호스트가 조용하다: 매치가 흐르는 중이면 짧게, 로비·로딩(호스트가 몇 초 멈출 수 있다)은 길게. 승계 목록의 다음 사람에게 넘어간다
+        const f64 lost = state == SessionState::Running && matchFlowing ? kHostLost : kTimeout;
+        if (now - h.lastRecv > lost) {
+            migrate("timed out");
+            if (host || state == SessionState::Ended) return;
         }
         if (state == SessionState::Lobby) {
             if (now - h.lastControlSend >= 1.0) { // 로비 유지 신호 (로드아웃·이름·준비)
@@ -1485,7 +1777,7 @@ struct LockstepSession::Impl {
             clientChat();
             return;
         }
-        if (state == SessionState::Running && now - lastBundle > kHostSilence) waitMask |= 1u; // 호스트에게서 아무것도 오지 않는다
+        if (state == SessionState::Running && now - lastBundle > kHostSilence) waitMask |= 1u << hostPlayer; // 호스트에게서 아무것도 오지 않는다
         if (state == SessionState::Running && (sendPending || now - h.lastSend >= kKeepAliveInterval)) {
             sendInput();
             sendPending = false;
@@ -1658,6 +1950,7 @@ const std::vector<LobbyMember>& LockstepSession::lobbyMembers() const { return m
 
 void LockstepSession::startMatch(u64 seed, u32 matchData) {
     if (!m->host || m->state != SessionState::Lobby) return;
+    m->localPlayer = m->hostPlayer = 0; // 이어받은 호스트도 새 매치에서는 0번
     m->rebuildMembers(); // 시작할 때의 목록 (매치 중에 보인다)
     m->playerCount = 1 + static_cast<u32>(m->peers.size());
     for (std::vector<u8>& l : m->loadouts) l.clear();
@@ -1744,8 +2037,11 @@ void LockstepSession::update(f64 now) {
 
 void LockstepSession::shutdown() {
     if (m->state == SessionState::Connecting || m->state == SessionState::Lobby || m->state == SessionState::Running) {
+        // 호스트가 나간다: 남은 사람은 승계 목록대로 이어 간다 (호스트 이전). 끝내는 것은 end()의 Disconnect
+        const bool handoff = m->host && !m->offline && !m->peers.empty() && m->state != SessionState::Connecting;
+        if (handoff) m->sendSuccession(); // 마지막 목록 (Handoff보다 먼저 닿게)
         Writer w;
-        header(w, Packet::Disconnect);
+        header(w, handoff ? Packet::Handoff : Packet::Disconnect);
         for (const Peer& p : m->peers) {
             m->send(p.address, w);
             m->send(p.address, w);
@@ -1859,6 +2155,15 @@ void LockstepSession::submitLocalInput(u32 tick, const PlayerInput& input) {
 }
 
 u32 LockstepSession::connectedMask() const { return m->connected; }
+
+u32 LockstepSession::hostMigrations() const { return m->migrations; }
+
+Address LockstepSession::hostAddress() const { return m->host || m->peers.empty() ? Address{} : m->peers[0].address; }
+
+Address LockstepSession::successorAddress() const {
+    // 플레이어 번호 순의 첫 클라이언트 (승계 목록의 다음 사람)
+    return !m->host || m->peers.empty() ? Address{} : m->peers[0].address;
+}
 
 bool LockstepSession::snapshotWanted() const { return m->host && m->state == SessionState::Running && m->snapshotWanted; }
 

@@ -28,6 +28,11 @@
 // 그 슬롯을, 처음 들어온 사람은 빈 슬롯을 받는다. 호스트는 게임(game::Simulation)에게 지금 틱의 월드 스냅샷을 받아(snapshotWanted →
 // provideSnapshot) LZ4로 압축해 나눠 보내고, 들어온 사람은 그 틱부터 확정된 입력으로 빨리 감아 따라잡는다(catchingUp). 다른 사람은 멈추지 않는다.
 // 접속·끊김은 엔진 확정 명령(kPresenceCommand)으로 모두 같은 틱에 시뮬레이션에 알린다(sim::readPresence).
+//
+// 호스트 이전: 호스트는 1초마다 승계 목록(자신, 클라이언트, 끊긴 사람: 번호·토큰·이름·주소)을 보낸다. 호스트가 나가면(Handoff) 또는
+// 매치가 흐르는 중 3초 조용하면(로비·로딩은 10초) 목록에서 옛 호스트를 뺀 첫 연결자가 호스트가 되고, 나머지는 그 주소로 다시 붙는다.
+// 새 호스트는 1초 동안 다른 피어의 더 앞선 확정 틱을 받아(TickRequest/TickFill) 이어 붙인 뒤 확정을 이어 가고, 옛 호스트 슬롯은 끊김 Presence.
+// 직접 UDP는 클라이언트끼리 이어 본 적이 없어 LAN에서만 보장한다 (Steam·EOS는 계정 id라 어디서나).
 namespace mealkit::net {
 
 inline constexpr u32 kMaxPlayers = 8;
@@ -207,6 +212,11 @@ public:
     void tickExecuted(u32 tick, u64 stateHash);
     // 매치 중 접속해 있는 플레이어 (비트 = 플레이어 번호, 실행한 틱 기준: 접속·끊김 명령을 실행하면 바뀐다)
     u32 connectedMask() const;
+    // 호스트 이전: 호스트가 나가면(Handoff) 또는 매치 중 3초 조용하면 승계 목록의 다음 사람이 호스트를 이어받는다 (isHost()가 바뀐다).
+    // hostAddress: 클라이언트일 때 지금 호스트 (Steam이면 계정 id), successorAddress: 호스트일 때 다음 호스트 (로비 소유자를 맞춘다)
+    u32 hostMigrations() const;
+    Address hostAddress() const;
+    Address successorAddress() const;
 
     // 중간 참가 (호스트): 들어오는 사람에게 보낼 스냅샷이 필요하다. 게임이 틱 사이에 provideSnapshot(다음에 실행할 틱, 바이트)으로 준다
     bool snapshotWanted() const;
