@@ -19,37 +19,37 @@ namespace mealkit::net {
 namespace {
 
 constexpr u32 kMagic = 0x52545341u; // "ASTR"
-constexpr u32 kMaxPacket = 1170;    // 인터넷 경로에서 쪼개지지 않는 크기이자 EOS P2P 상한 (EOS_P2P_MAX_PACKET_SIZE)
+constexpr u32 kMaxPacket = 1170;    // size that doesn't fragment on internet paths, and the EOS P2P limit (EOS_P2P_MAX_PACKET_SIZE)
 constexpr f64 kKeepAliveInterval = 1.0 / 30.0;
 constexpr f64 kLobbyInterval = 0.5;
 constexpr f64 kConnectInterval = 0.25;
 constexpr f64 kStartResendInterval = 0.1;
 constexpr f64 kChatResendInterval = 0.1;
 constexpr f64 kTimeout = 10.0;
-constexpr f64 kStallReport = 0.15;     // 이만큼 확정이 멈추면 누구를 기다리는지 알린다
-constexpr f64 kHostSilence = 0.3;      // 클라이언트: 호스트 묶음이 이만큼 없으면 호스트를 기다린다
-constexpr f64 kDelayCheckInterval = 1.0; // 호스트: 입력 지연을 다시 볼 간격
-constexpr f64 kDelayChangeInterval = 3.0; // 호스트: 입력 지연을 바꾼 뒤 다음 변경까지
-const u32 kDelayCommandType = static_cast<u32>(fnv1a("mealkit.net.InputDelay")); // 엔진 확정 명령 (게임 명령과 겹치지 않는 이름)
-const u32 kPresenceCommandType = static_cast<u32>(fnv1a(kPresenceCommand)); // 접속·끊김 (Lockstep.h)
-constexpr u32 kSnapshotChunk = 1100;      // 스냅샷 패킷 하나의 데이터 (머리를 더해 kMaxPacket 안)
-constexpr u32 kSnapshotWindow = 32 * kSnapshotChunk; // 확인받지 않고 보내 두는 양
-constexpr f64 kSnapshotResend = 0.25;     // 확인이 이만큼 나아가지 않으면 확인받은 곳부터 다시
+constexpr f64 kStallReport = 0.15;     // when confirmation stalls this long, report who we're waiting for
+constexpr f64 kHostSilence = 0.3;      // client: if no host bundle for this long, wait for the host
+constexpr f64 kDelayCheckInterval = 1.0; // host: interval for rechecking input delay
+constexpr f64 kDelayChangeInterval = 3.0; // host: after changing input delay, until the next change
+const u32 kDelayCommandType = static_cast<u32>(fnv1a("mealkit.net.InputDelay")); // engine confirmed command (a name that doesn't collide with game commands)
+const u32 kPresenceCommandType = static_cast<u32>(fnv1a(kPresenceCommand)); // connect/disconnect (Lockstep.h)
+constexpr u32 kSnapshotChunk = 1100;      // data per snapshot packet (within kMaxPacket with the header)
+constexpr u32 kSnapshotWindow = 32 * kSnapshotChunk; // amount sent ahead without acknowledgement
+constexpr f64 kSnapshotResend = 0.25;     // if acknowledgement doesn't advance for this long, resend from the acknowledged point
 constexpr u32 kCaughtUpTicks = 2;
-constexpr f64 kStaleConnection = 1.0;     // 호스트: 이만큼 소식이 없는 연결은 같은 이름의 재접속이 대신한다         // 클라이언트: 확정된 끝에서 이만큼 안이면 따라잡았다
+constexpr f64 kStaleConnection = 1.0;     // host: a connection silent this long is replaced by a reconnect with the same name         // client: caught up when within this of the confirmed end
 constexpr u32 kMaxTicksPerPacket = 32;
 constexpr u32 kNoTick = 0xFFFFFFFFu;
-constexpr u32 kMaxPendingCommands = 256; // 호스트: 틱을 기다리는 명령
-constexpr u32 kMaxOutCommands = 64;      // 클라이언트: 호스트가 확인하지 않은 명령
-constexpr u32 kMaxOutChat = 16;          // 클라이언트: 호스트가 확인하지 않은 채팅
-constexpr u32 kMaxRelayLog = 64;         // 호스트: 아직 모두가 확인하지 않은 채팅
-// 호스트 이전 (docs/DECISIONS.md 2026-10-28)
-constexpr f64 kSuccessionInterval = 1.0; // 호스트: 승계 목록을 보내는 간격
-constexpr f64 kHostLost = 3.0;           // 클라이언트: 매치가 흐르는 중 호스트가 이만큼 조용하면 승계자에게 넘어간다 (로비·로딩은 kTimeout)
-constexpr f64 kMigrateHold = 1.0;        // 새 호스트: 다른 피어의 더 앞선 확정 틱을 기다리는 시간 (그동안 스스로 확정하지 않는다)
+constexpr u32 kMaxPendingCommands = 256; // host: commands waiting for a tick
+constexpr u32 kMaxOutCommands = 64;      // client: commands not yet acknowledged by the host
+constexpr u32 kMaxOutChat = 16;          // client: chat not yet acknowledged by the host
+constexpr u32 kMaxRelayLog = 64;         // host: chat not yet acknowledged by everyone
+// Host migration (docs/DECISIONS.md 2026-10-28)
+constexpr f64 kSuccessionInterval = 1.0; // host: interval for sending the succession list
+constexpr f64 kHostLost = 3.0;           // client: if the host is silent this long while the match is flowing, hand over to the successor (lobby/loading use kTimeout)
+constexpr f64 kMigrateHold = 1.0;        // new host: time to wait for other peers' further confirmed ticks (doesn't confirm on its own meanwhile)
 constexpr f64 kTickRequestInterval = 0.1;
-constexpr f64 kUpdateGap = 0.5;          // 클라이언트: update 사이가 이보다 길면 (내가 멈춰 있었다) 그동안은 침묵으로 세지 않는다
-constexpr u32 kUnknownSeq = 0xFFFFFFFFu; // 새 호스트: 이 피어의 명령·채팅 번호를 아직 모른다 (처음 받은 것부터)
+constexpr f64 kUpdateGap = 0.5;          // client: if the gap between updates is longer than this (I was stalled), that time isn't counted as silence
+constexpr u32 kUnknownSeq = 0xFFFFFFFFu; // new host: this peer's command/chat numbers aren't known yet (start from the first received)
 
 enum class Packet : u8 {
     ConnectRequest = 1,
@@ -60,22 +60,22 @@ enum class Packet : u8 {
     Input,
     Bundle,
     Disconnect,
-    Chat,      // 클라이언트 → 호스트: 보낼 채팅 + 받은 채팅 확인
-    ChatRelay, // 호스트 → 클라이언트: 모두의 채팅 + 보낸 채팅 확인
-    Roster,    // 호스트 → 클라이언트: 매치 중 명단 (로비 신호와 같은 모양: 이름·핑, 로비로 돌아가지는 않는다)
-    Snapshot,    // 호스트 → 중간 참가: 압축한 월드 스냅샷 조각 [매치][위치 u32][크기 u16][바이트]
-    SnapshotAck, // 중간 참가 → 호스트: 처음부터 이어서 받은 바이트 수
-    Succession,  // 호스트 → 클라이언트: 승계 목록 [수 u8]{번호 u8, 연결 u8, 토큰 u64, 이름, ip u32, 포트 u16, 사용자 id u64} (호스트 자신 먼저)
-    Handoff,     // 호스트 → 클라이언트: 호스트가 나간다, 승계 목록대로 넘어가라 (Disconnect 대신)
-    TickRequest, // 새 호스트 → 클라이언트: [매치][이 틱부터] 네가 가진 확정 틱을 보내라
-    TickFill,    // 클라이언트 → 새 호스트: [매치][첫 틱 u32][수 u8] 틱마다 kMaxPlayers × 입력 + 명령
+    Chat,      // client → host: chat to send + acknowledgement of received chat
+    ChatRelay, // host → client: everyone's chat + acknowledgement of sent chat
+    Roster,    // host → client: roster during the match (same shape as the lobby signal: name/ping, doesn't return to the lobby)
+    Snapshot,    // host → late joiner: compressed world snapshot chunk [match][offset u32][size u16][bytes]
+    SnapshotAck, // late joiner → host: number of bytes received contiguously from the start
+    Succession,  // host → client: succession list [count u8]{index u8, connected u8, token u64, name, ip u32, port u16, user id u64} (host itself first)
+    Handoff,     // host → client: the host is leaving, hand over per the succession list (instead of Disconnect)
+    TickRequest, // new host → client: [match][from this tick] send me the confirmed ticks you have
+    TickFill,    // client → new host: [match][first tick u32][count u8] per tick kMaxPlayers × input + commands
 };
 using Reject = RejectReason;
 
 constexpr u8 kMemberReady = 1;
 constexpr u8 kMemberHost = 2;
 
-u32 toMs(f64 seconds) { return static_cast<u32>(seconds * 1000.0) + 1; } // 0은 "없음"
+u32 toMs(f64 seconds) { return static_cast<u32>(seconds * 1000.0) + 1; } // 0 means "none"
 
 const char* rejectText(Reject r) {
     switch (r) {
@@ -106,7 +106,7 @@ struct Writer {
         std::memcpy(data + size, p, n);
         size += n;
     }
-    void text(const std::string& s) { // u8 길이 + 바이트 (255바이트까지)
+    void text(const std::string& s) { // u8 length + bytes (up to 255 bytes)
         const u32 n = std::min<u32>(static_cast<u32>(s.size()), 255);
         put(static_cast<u8>(n));
         bytes(s.data(), n);
@@ -155,7 +155,7 @@ struct HashEntry {
 
 struct Slot {
     u32 tick = kNoTick;
-    u32 mask = 0; // 입력이 도착한 플레이어 비트
+    u32 mask = 0; // bits of players whose input arrived
     bool complete = false;
     TickInputs inputs{};
 };
@@ -165,39 +165,39 @@ struct Peer {
     u8 playerId = 0;
     f64 lastRecv = -1.0;
     f64 lastSend = -1.0;
-    f64 lastControlSend = -1.0; // 접속 요청 / 로비 / 시작 패킷
+    f64 lastControlSend = -1.0; // join request / lobby / start packets
     f64 lastChatSend = -1.0;
-    bool started = false;       // 호스트: 이 클라이언트가 시작을 확인했는가
-    u32 inputNext = 0;          // 호스트: 이 클라이언트에게서 연속으로 받은 입력의 다음 틱
-    u32 bundleNext = 0;         // 호스트: 이 클라이언트가 아직 못 받은 첫 확정 틱
-    u32 echoTime = 0;           // RTT 측정용으로 되돌려 줄 상대 시각
-    u32 commandNext = 0;        // 호스트: 이 클라이언트에게서 받은 명령의 다음 번호
-    f32 rttMs = 0.0f;           // 호스트: 이 클라이언트와의 왕복 시간 (지수 평균)
-    u32 hostEcho = 0;           // 클라이언트: 호스트가 보낸 시각 (되돌려 줘서 호스트가 왕복 시간을 잰다)
-    std::vector<u8> loadout;    // 호스트: 로비에서 받은 이 클라이언트의 매치 시작 데이터
-    std::string name;           // 호스트: 로비 이름
-    bool ready = false;         // 호스트: 로비 준비
-    u32 chatNext = 0;           // 호스트: 이 클라이언트에게서 받은 채팅의 다음 번호
-    u32 relayNext = 0;          // 호스트: 이 클라이언트가 확인한 중계 채팅의 다음 번호
-    bool chatAckDirty = false;  // 호스트: 받은 채팅을 확인해 줘야 한다
-    u64 token = 0;              // 호스트: 이 클라이언트의 세션 토큰 (재접속 때 같은 슬롯을 찾는다)
-    // 호스트, 중간 참가: 스냅샷을 받는 중(late && !started)이거나 확정된 틱을 따라잡는 중(catchUp)
+    bool started = false;       // host: whether this client acknowledged the start
+    u32 inputNext = 0;          // host: next tick of inputs received contiguously from this client
+    u32 bundleNext = 0;         // host: first confirmed tick this client hasn't received yet
+    u32 echoTime = 0;           // the peer's time to echo back for RTT measurement
+    u32 commandNext = 0;        // host: next number of commands received from this client
+    f32 rttMs = 0.0f;           // host: round-trip time with this client (exponential average)
+    u32 hostEcho = 0;           // client: time sent by the host (echoed back so the host measures the round trip)
+    std::vector<u8> loadout;    // host: this client's match start data received in the lobby
+    std::string name;           // host: lobby name
+    bool ready = false;         // host: lobby ready
+    u32 chatNext = 0;           // host: next number of chat received from this client
+    u32 relayNext = 0;          // host: next number of relayed chat this client acknowledged
+    bool chatAckDirty = false;  // host: needs to acknowledge received chat
+    u64 token = 0;              // host: this client's session token (finds the same slot on reconnect)
+    // Host, late join: receiving the snapshot (late && !started) or catching up on confirmed ticks (catchUp)
     bool late = false;
     bool catchUp = false;
-    std::shared_ptr<const std::vector<u8>> snapshot; // 압축한 스냅샷 (provideSnapshot 뒤)
+    std::shared_ptr<const std::vector<u8>> snapshot; // compressed snapshot (after provideSnapshot)
     u32 snapshotTick = kNoTick;
-    u32 snapshotRaw = 0;        // 압축 전 크기
-    u32 snapshotCount = 0;      // 스냅샷 틱의 참가 인원·접속 (시작 패킷에 싣는다)
+    u32 snapshotRaw = 0;        // size before compression
+    u32 snapshotCount = 0;      // player count/connections at the snapshot tick (carried in the start packet)
     u32 snapshotConnected = 0;
     u32 snapshotAcked = 0, snapshotSent = 0;
     f64 snapshotProgress = 0.0;
     HashEntry reported[kTickWindow];
-    // 새 호스트: 호스트 이전 뒤 이 피어에게서 소식을 들었다, 그 피어가 가진 확정 틱의 끝
+    // New host: heard from this peer after host migration; the end of the confirmed ticks that peer has
     bool heard = true;
     u32 clientFinal = 0;
 };
 
-// 승계 목록 한 줄 (호스트 이전)
+// One line of the succession list (host migration)
 struct Successor {
     u8 player = 0;
     bool connected = true;
@@ -206,7 +206,7 @@ struct Successor {
     Address address;
 };
 
-// 호스트: 매치 중에 끊긴 사람 (다시 들어오면 같은 슬롯)
+// Host: someone who disconnected mid-match (gets the same slot on rejoin)
 struct Departed {
     u8 playerId = 0;
     u64 token = 0;
@@ -214,18 +214,18 @@ struct Departed {
 };
 
 struct Command {
-    u32 seq = 0;   // 클라이언트: 보낸 순서 번호
-    u8 player = 0; // 호스트: 보낸 플레이어
+    u32 seq = 0;   // client: send sequence number
+    u8 player = 0; // host: player who sent it
     u8 size = 0;
     u8 data[kMaxCommandBytes];
 };
 
-struct OutChat { // 클라이언트: 호스트가 확인하지 않은 내 채팅
+struct OutChat { // client: my chat not yet acknowledged by the host
     u32 seq = 0;
     std::string text;
 };
 
-struct RelayChat { // 호스트: 모두에게 나눠 주는 채팅 (번호 순)
+struct RelayChat { // host: chat distributed to everyone (in number order)
     u32 index = 0;
     u8 player = 0;
     std::string name;
@@ -261,7 +261,7 @@ u32 buildId() {
 std::string clampUtf8(const std::string& text, u32 maxBytes) {
     if (text.size() <= maxBytes) return text;
     size_t end = maxBytes;
-    while (end > 0 && (static_cast<u8>(text[end]) & 0xC0) == 0x80) --end; // 글자 중간에서 자르지 않는다
+    while (end > 0 && (static_cast<u8>(text[end]) & 0xC0) == 0x80) --end; // don't cut in the middle of a character
     return text.substr(0, end);
 }
 
@@ -270,12 +270,12 @@ struct LockstepSession::Impl {
     std::string endReason;
     bool host = false;
     bool offline = false;
-    bool replay = false;               // startReplay: 입력은 replayInputs에서
+    bool replay = false;               // startReplay: inputs come from replayInputs
     std::vector<TickInputs> replayInputs;
-    std::vector<u64> replayHashes;     // replayInputs[t]를 실행한 뒤의 해시 (비어 있으면 비교하지 않는다)
+    std::vector<u64> replayHashes;     // hashes after running replayInputs[t] (not compared if empty)
     bool netStarted = false;
     std::unique_ptr<Transport> transport;
-    std::vector<Peer> peers; // 호스트: 클라이언트들 (플레이어 번호 순) / 클라이언트: [0] = 호스트
+    std::vector<Peer> peers; // host: clients (in player index order) / client: [0] = host
 
     u32 maxPlayers = 1;
     u32 playerCount = 1;
@@ -286,83 +286,83 @@ struct LockstepSession::Impl {
     u32 inputDelay = 3;
     u64 contentHash = 0;
     u64 contentParts[static_cast<u32>(ContentPart::Count)] = {};
-    u64 simVersion = 0;      // 0이면 buildId()
+    u64 simVersion = 0;      // buildId() if 0
     std::string gameVersion;
-    RejectInfo rejectInfo;   // 클라이언트: 거부당한 이유
+    RejectInfo rejectInfo;   // client: why we were rejected
     bool acceptOtherBuilds = false;
     NetConditions conditions;
     AutoDelay autoDelay;
     f64 lastDelayCheck = 0.0, lastDelayChange = 0.0;
-    bool delayChangePending = false; // 호스트: 보낸 지연 변경 명령이 아직 실행되지 않았다
-    PlayerInput lastLocalInput;      // 지연이 늘 때 빈 틱을 채운다
-    u32 matchIndex = 0; // 시작한 매치 수 (호스트가 정하고 시작·로비 패킷으로 알린다)
+    bool delayChangePending = false; // host: the delay change command sent hasn't executed yet
+    PlayerInput lastLocalInput;      // fills empty ticks when the delay grows
+    u32 matchIndex = 0; // number of matches started (decided by the host, announced via start/lobby packets)
 
     Slot slots[kTickWindow];
-    u32 finalNext = 0;    // 확정된 틱의 끝 (이 틱부터 미확정)
-    u32 executedNext = 0; // 다음에 실행할 틱
+    u32 finalNext = 0;    // end of confirmed ticks (unconfirmed from this tick)
+    u32 executedNext = 0; // next tick to run
 
-    PlayerInput localInputs[kTickWindow]; // 클라이언트: 호스트가 확인하기 전까지 보관
-    std::deque<Command> outCommands;      // 클라이언트: 호스트가 확인하기 전까지 보관 (매 입력 패킷에 다시 싣는다)
+    PlayerInput localInputs[kTickWindow]; // client: kept until the host acknowledges
+    std::deque<Command> outCommands;      // client: kept until the host acknowledges (re-sent in every input packet)
     u32 nextCommandSeq = 0;
-    std::vector<Command> pendingCommands; // 호스트: 받은 순서, 다음에 확정하는 틱에 싣는다
+    std::vector<Command> pendingCommands; // host: in received order, put in the next confirmed tick
     std::vector<u8> localLoadout;
-    std::vector<u8> loadouts[kMaxPlayers]; // 확정된 매치 시작 데이터
+    std::vector<u8> loadouts[kMaxPlayers]; // confirmed match start data
     u32 localSubmittedNext = 0;
     u32 hostInputAckNext = 0;
 
-    // 왕복 시간·멈춤 (플레이어용 네트워크 표시, 입력 지연 자동 조절)
+    // Round-trip time/stalls (network display for players, automatic input delay adjustment)
     u32 playerPing[kMaxPlayers] = {};
     u32 waitMask = 0;
-    f64 lastFinalize = 0.0; // 호스트: finalNext가 마지막으로 나아간 시각
-    f64 lastBundle = 0.0;   // 클라이언트: 마지막 묶음 수신
+    f64 lastFinalize = 0.0; // host: time finalNext last advanced
+    f64 lastBundle = 0.0;   // client: last bundle received
 
-    // 로비
+    // Lobby
     std::string localName;
     bool localReady = false;
-    std::vector<LobbyMember> members; // 호스트: update마다 다시 만든다 / 클라이언트: 로비 신호에서
-    std::vector<f64> memberSeen;      // 클라이언트: members마다 마지막으로 받은 시각 (나간 사람을 지운다)
-    u32 memberCursor = 0;             // 호스트: 로비 신호에 다 들어가지 않으면 다음 신호는 여기부터
+    std::vector<LobbyMember> members; // host: rebuilt every update / client: from lobby signals
+    std::vector<f64> memberSeen;      // client: last receive time per member (removes people who left)
+    u32 memberCursor = 0;             // host: if not everything fits in a lobby signal, the next signal starts here
 
-    // 채팅
+    // Chat
     std::vector<ChatMessage> chatLog;
     u32 chatSerial = 0;
     f64 lastLocalChat = -1e9;
-    std::deque<OutChat> outChat;   // 클라이언트
-    u32 nextChatSeq = 0;           // 클라이언트
-    u32 relayExpected = 0;         // 클라이언트: 다음에 받을 중계 번호
-    bool relayStarted = false;     // 클라이언트: 첫 중계 패킷을 받았다
-    bool relayAckDirty = false;    // 클라이언트
-    f64 lastChatSend = -1.0;       // 클라이언트
-    std::deque<RelayChat> relayLog; // 호스트
-    u32 relayEnd = 0;               // 호스트: 다음 중계 번호
+    std::deque<OutChat> outChat;   // client
+    u32 nextChatSeq = 0;           // client
+    u32 relayExpected = 0;         // client: next relay number to receive
+    bool relayStarted = false;     // client: received the first relay packet
+    bool relayAckDirty = false;    // client
+    f64 lastChatSend = -1.0;       // client
+    std::deque<RelayChat> relayLog; // host
+    u32 relayEnd = 0;               // host: next relay number
 
-    // 중간 참가·재접속
-    u64 localToken = 0;                 // 이 세션 객체의 토큰 (reset 뒤에도 남는다)
-    u32 connected = 0;                  // 실행한 틱 기준 접속 비트
-    u32 requiredFrom[kMaxPlayers] = {}; // 호스트: 이 틱부터 이 플레이어의 입력을 기다린다 (kNoTick: 기다리지 않는다, 빈 입력)
-    u32 width = 1;                      // 호스트: 묶음에 싣는 플레이어 수 (쓴 적 있는 가장 큰 번호 + 1)
-    std::vector<Departed> departed;     // 호스트
-    bool snapshotWanted = false;        // 호스트: 게임에게 스냅샷을 달라고 한다
-    std::deque<TickInputs> joinLog;     // 호스트: 따라잡는 사람에게 보낼 확정 틱 (링 버퍼에서 밀려난 것까지)
+    // Late join/reconnect
+    u64 localToken = 0;                 // this session object's token (survives reset)
+    u32 connected = 0;                  // connection bits as of executed ticks
+    u32 requiredFrom[kMaxPlayers] = {}; // host: waits for this player's input from this tick (kNoTick: doesn't wait, empty input)
+    u32 width = 1;                      // host: number of players carried in bundles (highest index ever used + 1)
+    std::vector<Departed> departed;     // host
+    bool snapshotWanted = false;        // host: asks the game for a snapshot
+    std::deque<TickInputs> joinLog;     // host: confirmed ticks to send to catching-up players (including those pushed out of the ring buffer)
     u32 joinLogBase = 0;
     bool joinLogging = false;
-    bool late = false;                  // 클라이언트: 매치 중에 들어왔다
-    u32 joinTick = 0;                   // 클라이언트: 스냅샷의 틱 (처음부터면 0)
+    bool late = false;                  // client: joined mid-match
+    u32 joinTick = 0;                   // client: the snapshot's tick (0 if from the start)
     u32 joinRaw = 0, joinCompressed = 0;
-    std::vector<u8> joinBuffer;         // 클라이언트: 받는 중인 압축 스냅샷 (전체 크기, 조각은 순서 없이 채운다)
-    std::vector<bool> joinChunks;       // 클라이언트: 받은 조각
-    u32 joinPrefix = 0;                 // 클라이언트: 처음부터 빠짐없이 받은 바이트 (호스트에게 확인)
-    std::vector<u8> joinSnapshot;       // 클라이언트: 푼 스냅샷 (게임이 가져간다)
-    bool catchingUp = false;            // 클라이언트
+    std::vector<u8> joinBuffer;         // client: compressed snapshot being received (full size, chunks filled out of order)
+    std::vector<bool> joinChunks;       // client: received chunks
+    u32 joinPrefix = 0;                 // client: bytes received without gaps from the start (acknowledged to the host)
+    std::vector<u8> joinSnapshot;       // client: decompressed snapshot (taken by the game)
+    bool catchingUp = false;            // client
 
-    // 호스트 이전
-    u8 hostPlayer = 0;                  // 지금 호스트의 플레이어 번호
-    std::vector<Successor> successors;  // 클라이언트: 호스트가 마지막으로 보낸 승계 목록 (호스트 자신 포함, 보낸 순서)
-    f64 lastSuccession = -1.0;          // 호스트
-    f64 migrateHold = 0.0;              // 새 호스트: 이 시각까지 앞선 확정 틱을 기다린다 (0 = 끝)
-    f64 lastTickRequest = -1.0;         // 새 호스트
-    f64 lastUpdate = -1.0;              // 클라이언트: 지난 update 시각
-    bool matchFlowing = false;          // 클라이언트: 이번 매치에서 묶음에 틱이 실려 왔다 (짧은 호스트 판정을 쓴다)
+    // Host migration
+    u8 hostPlayer = 0;                  // current host's player index
+    std::vector<Successor> successors;  // client: the succession list last sent by the host (including the host, in send order)
+    f64 lastSuccession = -1.0;          // host
+    f64 migrateHold = 0.0;              // new host: waits until this time for further confirmed ticks (0 = done)
+    f64 lastTickRequest = -1.0;         // new host
+    f64 lastUpdate = -1.0;              // client: time of the last update
+    bool matchFlowing = false;          // client: ticks have arrived in bundles this match (use the short host timeout)
     u32 migrations = 0;
 
     HashEntry hashes[kTickWindow];
@@ -379,7 +379,7 @@ struct LockstepSession::Impl {
     u64 recvBytes = 0;
 
     u32 allMask() const { return (1u << playerCount) - 1u; }
-    // 호스트: 이 틱을 확정하려면 입력이 있어야 하는 플레이어 (끊긴 사람·아직 따라잡는 사람은 빈 입력)
+    // Host: players whose input is needed to confirm this tick (disconnected or still catching up players get empty input)
     u32 needMask(u32 tick) const {
         u32 mask = 0;
         for (u32 player = 0; player < kMaxPlayers; ++player)
@@ -388,7 +388,7 @@ struct LockstepSession::Impl {
     }
     Slot& slot(u32 tick) { return slots[tick % kTickWindow]; }
     const Slot& slot(u32 tick) const { return slots[tick % kTickWindow]; }
-    u8 matchByte() const { return static_cast<u8>(matchIndex); } // 입력·묶음 패킷: 지난 매치의 늦은 패킷을 버린다
+    u8 matchByte() const { return static_cast<u8>(matchIndex); } // input/bundle packets: drops late packets from the previous match
 
     Slot& claim(u32 tick) {
         Slot& s = slot(tick);
@@ -399,12 +399,12 @@ struct LockstepSession::Impl {
         return s;
     }
 
-    // 아직 필요한 가장 오래된 틱. 링 버퍼가 이보다 kTickWindow 이상 앞서면 덮어쓰게 되므로 받지 않는다.
+    // Oldest tick still needed. If the ring buffer gets kTickWindow or more ahead of it, it would overwrite, so don't accept.
     u32 windowLow() const {
         u32 low = executedNext;
         if (host)
             for (const Peer& p : peers)
-                if (!(p.late && !p.started) && !p.catchUp) low = std::min(low, p.bundleNext); // 들어오는 사람은 joinLog에서 받는다
+                if (!(p.late && !p.started) && !p.catchUp) low = std::min(low, p.bundleNext); // joiners receive from joinLog
         return low;
     }
     bool inWindow(u32 tick) const { return tick + 1 < windowLow() + kTickWindow; }
@@ -412,7 +412,7 @@ struct LockstepSession::Impl {
     void beginRunning() {
         for (Slot& s : slots) s = Slot{};
         for (HashEntry& h : hashes) h = HashEntry{};
-        // 처음 inputDelay 틱은 모두 빈 입력으로 확정된 상태에서 시작한다.
+        // Starts with the first inputDelay ticks all confirmed with empty input.
         for (u32 t = 0; t < inputDelay; ++t) {
             Slot& s = claim(t);
             s.mask = allMask();
@@ -442,7 +442,7 @@ struct LockstepSession::Impl {
         lastLocalInput = {};
         matchFlowing = false;
         migrateHold = 0.0;
-        lastSuccession = -1.0; // 매치 번호로 다시 매긴 목록을 바로 보낸다
+        lastSuccession = -1.0; // send the list renumbered by match right away
         state = SessionState::Running;
     }
 
@@ -452,14 +452,14 @@ struct LockstepSession::Impl {
         return delayForRtt(worst, autoDelay);
     }
 
-    // 호스트: 매치 중 왕복 시간이 바뀌면 지연을 바꾸는 엔진 명령을 보낸다 (늘릴 때는 필요한 만큼 바로, 줄일 때는 2틱 넘게 남을 때 1틱씩)
+    // Host: when round-trip time changes mid-match, sends an engine command that changes the delay (increase as much as needed at once, decrease by 1 tick when more than 2 ticks remain)
     void adjustDelay() {
         if (!autoDelay.enabled || offline || delayChangePending || now - lastDelayCheck < kDelayCheckInterval) return;
         lastDelayCheck = now;
         if (now - lastDelayChange < kDelayChangeInterval) return;
         const u32 want = desiredDelay();
         u32 next = inputDelay;
-        if (want > inputDelay) next = want; // 늘릴 때는 한 번에 (멈칫거림이 바로 사라진다)
+        if (want > inputDelay) next = want; // increases happen at once (stutter disappears immediately)
         else if (want + 2 <= inputDelay) next = inputDelay - 1;
         if (next == inputDelay) return;
         if (queueDelay(next)) lastDelayChange = now;
@@ -477,12 +477,12 @@ struct LockstepSession::Impl {
         return true;
     }
 
-    // 모든 피어가 같은 틱(지연 명령이 든 틱)을 실행한 직후 바꾼다. 다음 제출은 (tick + 새 지연)
+    // Changed right after all peers run the same tick (the tick containing the delay command). The next submission is (tick + new delay)
     void applyDelay(u32 tick, u32 next) {
         next = std::clamp(next, 1u, 30u);
         if (next == inputDelay) return;
         MEALKIT_INFO("Input delay %u -> %u ticks from tick %u", inputDelay, next, tick);
-        // 늘면 (tick-1+예전)과 (tick+새) 사이가 빈다: 마지막 내 입력으로 채운다 (줄면 겹치는 틱은 submitLocalInput이 건너뛴다)
+        // When it grows, the gap between (tick-1+old) and (tick+new) is empty: filled with my last input (when it shrinks, submitLocalInput skips overlapping ticks)
         for (u32 t = tick + inputDelay; t < tick + next; ++t) {
             if (host) {
                 Slot& s = claim(t);
@@ -514,7 +514,7 @@ struct LockstepSession::Impl {
             Slot& s = slot(finalNext);
             if (s.tick != finalNext) break;
             if (!s.complete) {
-                if (host && holding()) break; // 새 호스트: 앞선 확정 틱이 올 수 있다 (스스로 정하면 갈라진다)
+                if (host && holding()) break; // new host: further confirmed ticks may arrive (deciding on its own would diverge)
                 const u32 need = host ? needMask(finalNext) : allMask();
                 if ((s.mask & need) != need) break;
                 if (host) packCommands(s.inputs);
@@ -527,7 +527,7 @@ struct LockstepSession::Impl {
         return finalNext != before;
     }
 
-    // 새 호스트: 다른 피어가 더 앞선 확정 틱을 가졌을 수 있다. 모두에게서 소식을 듣고 그 틱을 다 받거나 kMigrateHold가 지나면 끝
+    // New host: other peers may have further confirmed ticks. Done once heard from everyone and all those ticks received, or kMigrateHold elapses
     bool holding() {
         if (migrateHold == 0.0) return false;
         bool wait = false;
@@ -540,7 +540,7 @@ struct LockstepSession::Impl {
         return true;
     }
 
-    // 호스트: 기다리던 명령을 이 틱에 싣는다. 플레이어 번호 → 받은 순서, 넘치면 그 플레이어의 나머지는 다음 틱 (순서 유지)
+    // Host: puts waiting commands in this tick. Player index → received order; on overflow that player's rest go to the next tick (order kept)
     void packCommands(TickInputs& in) {
         in.commandBytes = 0;
         if (pendingCommands.empty()) return;
@@ -563,7 +563,7 @@ struct LockstepSession::Impl {
         pendingCommands.resize(keep);
     }
 
-    // 호스트: 접속·끊김 엔진 명령 (보낸 플레이어 = 그 슬롯). 모두 같은 틱에 applyPresence와 시뮬레이션이 처리한다
+    // Host: connect/disconnect engine command (sending player = that slot). Everyone processes it with applyPresence and the simulation at the same tick
     void queuePresence(u8 player, bool isConnected, const std::vector<u8>& loadout) {
         Command c;
         c.player = player;
@@ -587,7 +587,7 @@ struct LockstepSession::Impl {
         if (host) width = std::max(width, playerCount);
     }
 
-    // 확정된 틱의 입력: 링 버퍼, 이미 밀려났으면 joinLog
+    // Inputs of a confirmed tick: ring buffer, or joinLog if already pushed out
     const TickInputs* finalized(u32 tick) const {
         const Slot& s = slot(tick);
         if (s.tick == tick && s.complete) return &s.inputs;
@@ -595,7 +595,7 @@ struct LockstepSession::Impl {
         return nullptr;
     }
 
-    // 호스트, 매치 중: 끊긴 사람은 빼고 계속한다 (그 슬롯은 빈 입력, 다시 들어오면 같은 슬롯)
+    // Host, mid-match: continues without disconnected players (their slot gets empty input, same slot on rejoin)
     void dropPeer(size_t index, const char* why) {
         const Peer& p = peers[index];
         MEALKIT_WARN("Player %u %s - the match goes on without them", p.playerId, why);
@@ -653,9 +653,9 @@ struct LockstepSession::Impl {
         if (chatLog.size() > kChatLogSize) chatLog.erase(chatLog.begin());
     }
 
-    // ---------------- 호스트 ----------------
+    // ---------------- Host ----------------
 
-    // 비어 있는 가장 작은 플레이어 번호 (로비에서 나간 사람의 번호를 다시 쓴다)
+    // Smallest empty player index (reuses the index of someone who left the lobby)
     u8 freePlayerId() const {
         for (u8 id = 0; id < kMaxPlayers; ++id) {
             bool used = id == localPlayer;
@@ -669,9 +669,9 @@ struct LockstepSession::Impl {
     void rebuildMembers() {
         members.clear();
         LobbyMember self;
-        self.player = localPlayer; // 이어받은 호스트는 0이 아닐 수 있다
+        self.player = localPlayer; // a successor host may not be 0
         self.name = displayName(localName, localPlayer);
-        self.ready = true; // 호스트는 시작하는 사람
+        self.ready = true; // the host is the one who starts
         self.host = true;
         self.loadout = localLoadout;
         members.push_back(std::move(self));
@@ -692,7 +692,7 @@ struct LockstepSession::Impl {
         header(w, Packet::ConnectAccept);
         w.put(p.playerId);
         w.put(static_cast<u8>(maxPlayers));
-        w.put(static_cast<u8>(state == SessionState::Running ? 1 : 0)); // 매치 중: 로비로 가지 않고 스냅샷을 기다린다
+        w.put(static_cast<u8>(state == SessionState::Running ? 1 : 0)); // mid-match: don't go to the lobby, wait for the snapshot
         send(p.address, w);
     }
 
@@ -708,14 +708,14 @@ struct LockstepSession::Impl {
         send(to, w);
     }
 
-    // 로비 신호: 인원 + 사람마다 (번호, 준비, 이름, 로드아웃). 다 들어가지 않으면 다음 신호가 이어서 싣는다
+    // Lobby signal: count + per person (index, ready, name, loadout). If not everything fits, the next signal continues
     void sendLobby(const Peer& p, Packet type = Packet::Lobby) {
         Writer w;
         header(w, type);
         w.put(static_cast<u8>(members.size()));
         w.put(static_cast<u8>(maxPlayers));
         w.put(matchIndex);
-        w.put(toMs(now)); // 클라이언트가 접속 요청에 되돌려 준다 (로비에서도 왕복 시간)
+        w.put(toMs(now)); // the client echoes it back in its join request (round-trip time in the lobby too)
         const u32 countAt = w.size;
         w.put(static_cast<u8>(0));
         u8 written = 0;
@@ -750,7 +750,7 @@ struct LockstepSession::Impl {
             w.bytes(loadouts[i].data(), static_cast<u32>(loadouts[i].size()));
         }
         w.put(static_cast<u8>(p.late ? 1 : 0));
-        if (p.late) { // 중간 참가: 스냅샷의 틱·크기, 그 틱의 접속
+        if (p.late) { // late join: snapshot tick/size, connections at that tick
             w.put(p.snapshotTick);
             w.put(p.snapshotRaw);
             w.put(static_cast<u32>(p.snapshot->size()));
@@ -773,10 +773,10 @@ struct LockstepSession::Impl {
         w.put(static_cast<u8>(width));
         for (u32 player = 0; player < width; ++player) w.put(static_cast<u16>(std::min<u32>(playerPing[player], 0xFFFF)));
         const u32 first = p.bundleNext;
-        const u32 perTick = width * kInputBytes + 2; // + 명령 바이트 수
+        const u32 perTick = width * kInputBytes + 2; // + command byte count
         const u32 available = finalNext > first ? std::min(finalNext - first, kMaxTicksPerPacket) : 0;
         u32 count = 0, bytes = w.size + 4 + 1;
-        while (count < available) { // 명령이 있는 틱은 커서 패킷에 들어가는 만큼만
+        while (count < available) { // ticks with commands are large, so only as many as fit in the packet
             const TickInputs* in = finalized(first + count);
             if (!in || bytes + perTick + in->commandBytes > kMaxPacket) break;
             bytes += perTick + in->commandBytes;
@@ -794,7 +794,7 @@ struct LockstepSession::Impl {
         p.lastSend = now;
     }
 
-    // 호스트 → 클라이언트: 아직 확인받지 못한 중계 채팅 + 받은 채팅 확인
+    // Host → client: relayed chat not yet acknowledged + acknowledgement of received chat
     void sendChatRelay(Peer& p) {
         Writer w;
         header(w, Packet::ChatRelay);
@@ -826,7 +826,7 @@ struct LockstepSession::Impl {
         c.text = text;
         relayLog.push_back(std::move(c));
         addChat(player, name, text);
-        // 모두가 확인한 줄은 버린다 (너무 많이 밀리면 오래된 줄부터)
+        // Lines acknowledged by everyone are dropped (if it backs up too much, oldest first)
         u32 low = relayEnd;
         for (const Peer& p : peers) low = std::min(low, p.relayNext);
         while (!relayLog.empty() && (relayLog.front().index < low || relayLog.size() > kMaxRelayLog)) relayLog.pop_front();
@@ -839,10 +839,10 @@ struct LockstepSession::Impl {
         }
     }
 
-    // 매치 중 접속: 끊긴 사람(같은 토큰, 아니면 같은 이름)은 그 슬롯, 아니면 빈 슬롯. 스냅샷은 게임에게 달라고 하고 다음 update부터 보낸다
+    // Mid-match join: disconnected players (same token, otherwise same name) get their slot, otherwise an empty slot. Ask the game for a snapshot and send from the next update
     Peer* acceptLate(const Address& from, u64 token, const std::string& name, const std::vector<u8>& loadout) {
-        // 같은 사람이 새 주소로 (네트워크가 바뀌었다, 또는 끊김을 알리지 못하고 나갔다가 다시 켰다): 예전 연결을 끊은 셈 친다.
-        // 토큰이 같거나, 같은 이름인데 예전 연결이 조용하다
+        // The same person from a new address (network changed, or quit without announcing and restarted): treated as the old connection disconnecting.
+        // Same token, or same name with a quiet old connection
         for (size_t i = 0; i < peers.size(); ++i)
             if ((token != 0 && peers[i].token == token) ||
                 (!name.empty() && peers[i].name == name && now - peers[i].lastRecv > kStaleConnection)) {
@@ -885,7 +885,7 @@ struct LockstepSession::Impl {
         return findPeer(from);
     }
 
-    // 호스트 → 중간 참가: 확인받지 않은 스냅샷 조각을 창 크기만큼. 확인이 멈추면 확인받은 곳부터 다시
+    // Host → late joiner: unacknowledged snapshot chunks up to the window size. If acknowledgement stalls, resend from the acknowledged point
     void sendSnapshot(Peer& p) {
         const std::vector<u8>& data = *p.snapshot;
         const u32 size = static_cast<u32>(data.size());
@@ -927,7 +927,7 @@ struct LockstepSession::Impl {
             const u32 hostEcho = r.get<u32>();
             const u64 token = r.get<u64>();
             if (!r.ok) return;
-            // 같은 시뮬레이션이어야 한다: 결정론 그룹(컴파일러·CPU) → 시뮬레이션 버전(게임 버전 + 시뮬레이션 소스) → 게임 데이터
+            // Must be the same simulation: determinism group (compiler/CPU) → simulation version (game version + simulation source) → game data
             if (group != determinismGroup() || build != mySimVersion()) {
                 if (!acceptOtherBuilds) {
                     sendReject(from, group != determinismGroup() ? Reject::Platform : Reject::Version);
@@ -959,7 +959,7 @@ struct LockstepSession::Impl {
                 p.address = from;
                 p.playerId = freePlayerId();
                 p.lastRecv = now;
-                p.relayNext = relayEnd; // 들어오기 전의 채팅은 보내지 않는다
+                p.relayNext = relayEnd; // chat from before joining isn't sent
                 p.token = token;
                 peers.push_back(p);
                 std::sort(peers.begin(), peers.end(), [](const Peer& a, const Peer& b) { return a.playerId < b.playerId; });
@@ -967,7 +967,7 @@ struct LockstepSession::Impl {
                 MEALKIT_INFO("Player joined from %s (%zu/%u)", from.toString().c_str(), peers.size() + 1, maxPlayers);
             }
             rttSample(*peer, hostEcho);
-            if (state == SessionState::Lobby) { // 로비 신호마다 새 값
+            if (state == SessionState::Lobby) { // new values every lobby signal
                 peer->loadout = std::move(loadout);
                 peer->name = std::move(name);
                 peer->ready = (flags & kMemberReady) != 0;
@@ -977,7 +977,7 @@ struct LockstepSession::Impl {
         }
         case Packet::Input: {
             if (!peer || state != SessionState::Running) return;
-            if (r.get<u8>() != matchByte()) return; // 지난 매치의 늦은 패킷
+            if (r.get<u8>() != matchByte()) return; // late packet from the previous match
             peer->started = true;
             const u32 bundleNext = r.get<u32>();
             const u32 echo = r.get<u32>();
@@ -988,10 +988,10 @@ struct LockstepSession::Impl {
             const u8 count = r.get<u8>();
             if (!r.ok) return;
             rttSample(*peer, hostEcho);
-            if (!peer->heard) peer->bundleNext = std::min(bundleNext, finalNext); // 호스트 이전 뒤 처음: 이 피어가 가진 끝부터 보낸다
+            if (!peer->heard) peer->bundleNext = std::min(bundleNext, finalNext); // first time after host migration: send from the end this peer has
             peer->heard = true;
             peer->clientFinal = bundleNext;
-            if (requiredFrom[peer->playerId] == kNoTick && count > 0) { // 중간 참가·재접속: 따라잡고 처음 낸 입력부터 기다린다
+            if (requiredFrom[peer->playerId] == kNoTick && count > 0) { // late join/reconnect: wait from the first input sent after catching up
                 requiredFrom[peer->playerId] = std::max(first, finalNext);
                 peer->inputNext = requiredFrom[peer->playerId];
                 MEALKIT_INFO("Player %u is caught up: inputs from tick %u", peer->playerId, peer->inputNext);
@@ -1019,7 +1019,7 @@ struct LockstepSession::Impl {
             }
             const u32 commandFirst = r.get<u32>();
             const u8 commandCount = r.get<u8>();
-            if (r.ok && peer->commandNext == kUnknownSeq) peer->commandNext = commandFirst; // 호스트 이전 뒤 처음
+            if (r.ok && peer->commandNext == kUnknownSeq) peer->commandNext = commandFirst; // first time after host migration
             for (u32 i = 0; r.ok && i < commandCount; ++i) {
                 Command c;
                 c.size = r.get<u8>();
@@ -1027,7 +1027,7 @@ struct LockstepSession::Impl {
                 r.bytes(c.data, c.size);
                 if (!r.ok) break;
                 const u32 seq = commandFirst + i;
-                if (seq < peer->commandNext) continue; // 이미 받은 것 (다시 실린 것)
+                if (seq < peer->commandNext) continue; // already received (re-sent)
                 if (seq > peer->commandNext || pendingCommands.size() >= kMaxPendingCommands) break;
                 c.player = peer->playerId;
                 pendingCommands.push_back(c);
@@ -1048,12 +1048,12 @@ struct LockstepSession::Impl {
             const u8 count = r.get<u8>();
             if (!r.ok) return;
             peer->relayNext = std::max(peer->relayNext, std::min(relayAck, relayEnd));
-            if (peer->chatNext == kUnknownSeq) peer->chatNext = firstSeq; // 호스트 이전 뒤 처음
+            if (peer->chatNext == kUnknownSeq) peer->chatNext = firstSeq; // first time after host migration
             for (u32 i = 0; i < count; ++i) {
                 const std::string text = r.text(kMaxChatBytes);
                 if (!r.ok) break;
                 const u32 seq = firstSeq + i;
-                if (seq < peer->chatNext) continue; // 이미 받은 것
+                if (seq < peer->chatNext) continue; // already received
                 if (seq > peer->chatNext) break;
                 ++peer->chatNext;
                 peer->chatAckDirty = true;
@@ -1061,7 +1061,7 @@ struct LockstepSession::Impl {
             }
             break;
         }
-        case Packet::TickFill: { // 호스트 이전: 옛 호스트가 확정했지만 내가 받지 못한 틱
+        case Packet::TickFill: { // host migration: ticks the old host confirmed but I didn't receive
             if (!peer || state != SessionState::Running || r.get<u8>() != matchByte()) return;
             const u32 first = r.get<u32>();
             const u8 count = r.get<u8>();
@@ -1075,7 +1075,7 @@ struct LockstepSession::Impl {
                 const u32 t = first + i;
                 if (t < finalNext || !inWindow(t)) continue;
                 Slot& s = claim(t);
-                s.inputs = in; // 옛 호스트가 정한 것이 맞다 (내가 채운 내 입력도 같은 값이다)
+                s.inputs = in; // what the old host decided is correct (my own input I filled in is the same value)
                 s.mask = ~0u;
                 s.complete = true;
             }
@@ -1108,7 +1108,7 @@ struct LockstepSession::Impl {
         }
     }
 
-    // 호스트 → 클라이언트: 승계 목록 (나, 그다음 연결된 클라이언트와 매치 중 끊긴 사람, 슬롯 순). 다 들어가지 않으면 앞쪽만
+    // Host → client: succession list (me, then connected clients and players disconnected mid-match, in slot order). If not everything fits, only the front part
     void sendSuccession() {
         Writer w;
         header(w, Packet::Succession);
@@ -1134,7 +1134,7 @@ struct LockstepSession::Impl {
         lastSuccession = now;
     }
 
-    // 새 호스트: 가장 앞선 확정 틱을 가진 피어에게 모자란 틱을 달라고 한다
+    // New host: asks the peer with the furthest confirmed tick for the missing ticks
     void requestTicks() {
         if (migrateHold == 0.0 || now - lastTickRequest < kTickRequestInterval) return;
         const Peer* best = nullptr;
@@ -1173,14 +1173,14 @@ struct LockstepSession::Impl {
         }
         if (state != SessionState::Running) return;
         requestTicks();
-        if (holding()) lastFinalize = now; // 기다리는 동안은 멈춤으로 알리지 않는다
+        if (holding()) lastFinalize = now; // while waiting, it isn't reported as a stall
         else if (finalize()) sendPending = true;
         adjustDelay();
         playerPing[localPlayer] = 0;
         for (const Peer& p : peers)
             if (p.playerId < kMaxPlayers) playerPing[p.playerId] = static_cast<u32>(p.rttMs + 0.5f);
         waitMask = 0;
-        if (now - lastFinalize > kStallReport) { // 확정이 멈췄다: 이 틱의 입력이 오지 않은 플레이어
+        if (now - lastFinalize > kStallReport) { // confirmation stalled: players whose input for this tick hasn't arrived
             const Slot& s = slot(finalNext);
             waitMask = needMask(finalNext) & ~(s.tick == finalNext ? s.mask : 0u);
         }
@@ -1190,7 +1190,7 @@ struct LockstepSession::Impl {
         }
         bool logNeeded = false;
         for (Peer& p : peers) {
-            if (p.late && !p.started) { // 중간 참가: 스냅샷이 준비되면 시작 패킷과 스냅샷 조각
+            if (p.late && !p.started) { // late join: once the snapshot is ready, start packet and snapshot chunks
                 if (p.snapshot) {
                     if (now - p.lastControlSend >= kStartResendInterval) {
                         sendStart(p);
@@ -1201,12 +1201,12 @@ struct LockstepSession::Impl {
                 logNeeded = true;
                 continue;
             }
-            if (p.catchUp && finalNext - p.bundleNext < kTickWindow / 2) p.catchUp = false; // 이제 링 버퍼에 있다
+            if (p.catchUp && finalNext - p.bundleNext < kTickWindow / 2) p.catchUp = false; // now within the ring buffer
             logNeeded = logNeeded || p.catchUp;
             if (!p.started && now - p.lastControlSend >= kStartResendInterval) {
                 sendStart(p);
                 p.lastControlSend = now;
-            } else if (p.started && now - p.lastControlSend >= kLobbyInterval) { // 매치 중 명단 (로비 신호 전에 시작한 사람도 이름을 안다)
+            } else if (p.started && now - p.lastControlSend >= kLobbyInterval) { // roster during the match (so people who started before a lobby signal know names too)
                 sendLobby(p, Packet::Roster);
                 p.lastControlSend = now;
             }
@@ -1217,7 +1217,7 @@ struct LockstepSession::Impl {
         hostChat();
     }
 
-    // 따라잡는 사람이 모두 받은 틱은 버린다. 아무도 없으면 그만 남긴다
+    // Ticks all catching-up players received are dropped. If nobody is catching up, stop keeping them
     void trimJoinLog(bool needed) {
         if (!needed) {
             joinLog.clear();
@@ -1233,7 +1233,7 @@ struct LockstepSession::Impl {
         }
     }
 
-    // ---------------- 클라이언트 ----------------
+    // ---------------- Client ----------------
 
     void sendConnect() {
         Writer w;
@@ -1281,7 +1281,7 @@ struct LockstepSession::Impl {
         h.lastSend = now;
     }
 
-    // 클라이언트 → 호스트: 확인받지 못한 내 채팅 + 받은 중계 확인
+    // Client → host: my unacknowledged chat + acknowledgement of received relays
     void clientChat() {
         if ((outChat.empty() && !relayAckDirty) || now - lastChatSend < kChatResendInterval) return;
         Writer w;
@@ -1302,17 +1302,17 @@ struct LockstepSession::Impl {
         relayAckDirty = false;
     }
 
-    // 호스트가 로비로 돌아갔다 (결과 화면 뒤): 매치를 끝내고 다시 준비를 고른다
+    // The host went back to the lobby (after the results screen): end the match and choose ready again
     void enterLobbyFromMatch() {
         state = SessionState::Lobby;
         localReady = false;
-        if (!peers.empty()) peers[0].lastControlSend = -1.0; // 로비 신호를 바로 보낸다
+        if (!peers.empty()) peers[0].lastControlSend = -1.0; // send the lobby signal right away
         MEALKIT_INFO("Back to the lobby (match %u ended)", matchIndex);
     }
 
-    // ---------------- 호스트 이전 ----------------
+    // ---------------- Host migration ----------------
 
-    // 승계 목록에서 다음 호스트: 지금 호스트를 뺀 첫 연결자
+    // Next host from the succession list: the first connected one excluding the current host
     const Successor* nextHost() const {
         for (const Successor& e : successors)
             if (e.connected && e.player != hostPlayer) return &e;
@@ -1324,20 +1324,20 @@ struct LockstepSession::Impl {
                (state == SessionState::Lobby || state == SessionState::Running) && nextHost() != nullptr;
     }
 
-    // 호스트가 나갔다·조용하다: 승계 목록의 다음 사람에게 붙거나 내가 호스트가 된다
+    // The host left/went silent: attach to the next person on the succession list or become the host myself
     void migrate(const char* why) {
         if (!canMigrate()) {
             end("Connection to the host was lost");
             return;
         }
         for (Successor& e : successors)
-            if (e.player == hostPlayer) e.connected = false; // 옛 호스트: 끊긴 사람 (같은 토큰으로 다시 들어오면 그 슬롯)
+            if (e.player == hostPlayer) e.connected = false; // old host: a disconnected player (gets that slot if rejoining with the same token)
         const Successor next = *nextHost();
         ++migrations;
         MEALKIT_WARN("Host player %u %s - player %u takes over the session (tick %u)", hostPlayer, why, next.player, finalNext);
         const u8 oldHost = hostPlayer;
         hostPlayer = next.player;
-        relayStarted = false; // 새 호스트의 중계 번호는 0부터
+        relayStarted = false; // the new host's relay numbers start from 0
         if (next.player == localPlayer) {
             becomeHost(oldHost);
             return;
@@ -1347,9 +1347,9 @@ struct LockstepSession::Impl {
         h.address = next.address;
         h.lastRecv = now;
         lastBundle = now;
-        matchFlowing = false; // 새 호스트가 틱을 보내기 시작할 때까지는 긴 판정
+        matchFlowing = false; // long timeout until the new host starts sending ticks
         if (state == SessionState::Running) {
-            hostInputAckNext = std::min(hostInputAckNext, finalNext); // 옛 호스트가 받고 확정하지 못한 내 입력은 다시 보낸다
+            hostInputAckNext = std::min(hostInputAckNext, finalNext); // my inputs the old host received but didn't confirm are resent
             sendInput();
         } else {
             sendConnect();
@@ -1385,14 +1385,14 @@ struct LockstepSession::Impl {
         relayEnd = 0;
         pendingCommands.clear();
         if (state == SessionState::Running) {
-            // 앞으로 기다릴 입력: 목록의 연결자와 나. 그 밖(옛 호스트, 목록 뒤에 들어온 사람)은 빈 입력 (다시 들어오면 그 슬롯)
+            // Inputs to wait for from now on: connected players on the list and me. Others (old host, people who joined after the list) get empty input (same slot on rejoin)
             for (u32 player = 0; player < kMaxPlayers; ++player) requiredFrom[player] = kNoTick;
             requiredFrom[localPlayer] = finalNext;
             for (const Peer& p : peers) requiredFrom[p.playerId] = finalNext;
             width = playerCount;
             for (u32 player = 0; player < kMaxPlayers; ++player)
                 if (requiredFrom[player] != kNoTick) width = std::max(width, player + 1);
-            // 내가 낸 입력 중 아직 확정되지 않은 것
+            // My submitted inputs not yet confirmed
             for (u32 t = finalNext; t < localSubmittedNext; ++t) {
                 Slot& pending = claim(t);
                 pending.inputs.players[localPlayer] = localInputs[t % kTickWindow];
@@ -1414,7 +1414,7 @@ struct LockstepSession::Impl {
         MEALKIT_INFO("This peer is the host now (player %u, %zu client(s), old host %u)", localPlayer, peers.size(), oldHost);
     }
 
-    // 클라이언트 → 새 호스트: 가진 확정 틱 (from부터, 패킷에 들어가는 만큼)
+    // Client → new host: confirmed ticks I have (from from, as many as fit in the packet)
     void sendTickFill(u32 from) {
         if (from >= finalNext) return;
         Writer w;
@@ -1439,7 +1439,7 @@ struct LockstepSession::Impl {
 
     void clientReceive(const Address& from, Reader& r, Packet type) {
         if (!(from == peers[0].address)) {
-            // 승계자가 먼저 호스트가 되어 보낸다 (Handoff를 놓쳤다): 바로 넘어간다
+            // The successor became host first and is sending (I missed the Handoff): switch over immediately
             const Successor* next = nextHost();
             const bool fromHost = type == Packet::Bundle || type == Packet::Succession || type == Packet::TickRequest ||
                                   type == Packet::Lobby || type == Packet::Roster;
@@ -1456,7 +1456,7 @@ struct LockstepSession::Impl {
             const u8 maxP = r.get<u8>();
             const u8 inMatch = r.get<u8>();
             if (!r.ok) return;
-            if (state == SessionState::Connecting && inMatch) { // 매치 중: 스냅샷을 받을 때까지 접속 중으로 남는다
+            if (state == SessionState::Connecting && inMatch) { // mid-match: stays connecting until the snapshot is received
                 if (!late) MEALKIT_INFO("Connected to %s - the match is running, waiting for its snapshot", from.toString().c_str());
                 late = true;
                 localPlayer = id;
@@ -1491,11 +1491,11 @@ struct LockstepSession::Impl {
             const u8 entries = r.get<u8>();
             if (!r.ok) return;
             h.hostEcho = hostTime;
-            if (type == Packet::Roster) { // 매치 중 명단: 이 매치의 것만
+            if (type == Packet::Roster) { // roster during the match: only this match's
                 if (state != SessionState::Running || hostMatch != matchIndex) return;
             } else {
                 if (state == SessionState::Running) {
-                    if (hostMatch < matchIndex) return; // 매치 시작 전에 보낸 늦은 신호
+                    if (hostMatch < matchIndex) return; // late signal sent before the match started
                     enterLobbyFromMatch();
                 }
                 if (state != SessionState::Lobby) return;
@@ -1524,7 +1524,7 @@ struct LockstepSession::Impl {
                 members[at] = std::move(entry);
                 memberSeen[at] = now;
             }
-            // 나간 사람: 로비 신호 몇 번 동안 다시 오지 않은 사람을 지운다 (신호마다 일부만 실릴 수 있다)
+            // People who left: remove those who haven't come back for a few lobby signals (each signal may carry only some)
             for (size_t i = 0; i < members.size();) {
                 if (now - memberSeen[i] > kLobbyInterval * 4.0) {
                     members.erase(members.begin() + static_cast<std::ptrdiff_t>(i));
@@ -1533,7 +1533,7 @@ struct LockstepSession::Impl {
                     ++i;
                 }
             }
-            for (size_t i = 1; i < members.size(); ++i) // 플레이어 번호 순 (삽입 정렬, 같이 옮긴다)
+            for (size_t i = 1; i < members.size(); ++i) // in player index order (insertion sort, moved together)
                 for (size_t j = i; j > 0 && members[j - 1].player > members[j].player; --j) {
                     std::swap(members[j - 1], members[j]);
                     std::swap(memberSeen[j - 1], memberSeen[j]);
@@ -1548,7 +1548,7 @@ struct LockstepSession::Impl {
             const u32 data = r.get<u32>();
             const u32 index = r.get<u32>();
             if (!r.ok || state == SessionState::Running || state == SessionState::Ended) return;
-            if (index <= matchIndex && matchIndex != 0) return; // 지난 매치의 늦은 시작 패킷
+            if (index <= matchIndex && matchIndex != 0) return; // late start packet from a previous match
             if (count == 0 || count > kMaxPlayers || id >= kMaxPlayers || delay == 0) return;
             std::vector<u8> startLoadouts[kMaxPlayers];
             for (u32 i = 0; i < count; ++i) {
@@ -1559,7 +1559,7 @@ struct LockstepSession::Impl {
             const u8 lateStart = r.get<u8>();
             if (!r.ok || (!lateStart && id >= count)) return;
             for (u32 i = 0; i < kMaxPlayers; ++i) loadouts[i] = std::move(startLoadouts[i]);
-            if (lateStart) { // 중간 참가: 스냅샷 조각을 기다린다 (다 받으면 startLate)
+            if (lateStart) { // late join: wait for snapshot chunks (startLate once all are received)
                 const u32 snapshotTick = r.get<u32>();
                 const u32 raw = r.get<u32>();
                 const u32 compressed = r.get<u32>();
@@ -1588,15 +1588,15 @@ struct LockstepSession::Impl {
             seed = matchSeed;
             matchData = data;
             matchIndex = index;
-            for (size_t i = 0; i < members.size(); ++i) members[i].player = static_cast<u8>(i); // 호스트처럼 빈 번호 없이
+            for (size_t i = 0; i < members.size(); ++i) members[i].player = static_cast<u8>(i); // no gaps in indices, like the host
             beginRunning();
             MEALKIT_INFO("Match started: player %u of %u, input delay %u ticks", id, count, delay);
-            sendInput(); // 시작 확인
+            sendInput(); // acknowledge the start
             break;
         }
         case Packet::Bundle: {
             if (state != SessionState::Running) return;
-            if (r.get<u8>() != matchByte()) return; // 지난 매치의 늦은 패킷
+            if (r.get<u8>() != matchByte()) return; // late packet from the previous match
             const u32 inputAckNext = r.get<u32>();
             const u32 echo = r.get<u32>();
             const u8 flags = r.get<u8>();
@@ -1604,7 +1604,7 @@ struct LockstepSession::Impl {
             const u32 commandAck = r.get<u32>();
             const u32 hostTime = r.get<u32>();
             const u8 hostWait = r.get<u8>();
-            const u8 players = r.get<u8>(); // 호스트가 싣는 플레이어 수 (중간 참가로 늘 수 있다)
+            const u8 players = r.get<u8>(); // number of players the host carries (can grow with late joins)
             if (!r.ok || players == 0 || players > kMaxPlayers) return;
             u32 pings[kMaxPlayers] = {};
             for (u32 player = 0; player < players; ++player) pings[player] = r.get<u16>();
@@ -1653,7 +1653,7 @@ struct LockstepSession::Impl {
             const u8 count = r.get<u8>();
             if (!r.ok) return;
             while (!outChat.empty() && outChat.front().seq < chatAck) outChat.pop_front();
-            if (!relayStarted) { // 처음 받은 묶음부터 (들어오기 전의 채팅은 없다)
+            if (!relayStarted) { // from the first bundle received (no chat from before joining)
                 relayStarted = true;
                 relayExpected = first;
             }
@@ -1664,7 +1664,7 @@ struct LockstepSession::Impl {
                 if (!r.ok) break;
                 const u32 index = first + i;
                 if (index < relayExpected) continue;
-                if (index > relayExpected) break; // 빠진 것이 있다: 다시 올 때까지 기다린다
+                if (index > relayExpected) break; // something is missing: wait until it comes again
                 ++relayExpected;
                 addChat(player, name, text);
             }
@@ -1676,7 +1676,7 @@ struct LockstepSession::Impl {
             const u32 offset = r.get<u32>();
             const u16 size = r.get<u16>();
             if (!r.ok || state != SessionState::Connecting || joinCompressed == 0 || match != matchByte()) return;
-            const u32 chunk = offset / kSnapshotChunk; // 순서가 바뀌어 와도 받아 둔다 (빠진 것은 호스트가 다시 보낸다)
+            const u32 chunk = offset / kSnapshotChunk; // kept even if out of order (the host resends missing ones)
             if (offset % kSnapshotChunk != 0 || chunk >= joinChunks.size() ||
                 size != std::min(kSnapshotChunk, joinCompressed - offset))
                 return;
@@ -1711,7 +1711,7 @@ struct LockstepSession::Impl {
                 if (r.ok) list.push_back(std::move(e));
             }
             if (!r.ok || list.empty()) return;
-            hostPlayer = list[0].player; // 호스트 자신이 먼저
+            hostPlayer = list[0].player; // the host itself first
             list[0].address = h.address;
             successors = std::move(list);
             break;
@@ -1726,7 +1726,7 @@ struct LockstepSession::Impl {
         }
     }
 
-    // 스냅샷을 다 받았다: 그 틱부터 확정된 입력을 받아 따라잡는다 (게임은 takeJoinSnapshot으로 월드를 불러온다)
+    // The whole snapshot is received: catch up with confirmed inputs from that tick (the game loads the world via takeJoinSnapshot)
     void startLate() {
         if (!decompressBytes(joinBuffer.data(), static_cast<u32>(joinBuffer.size()), joinRaw, joinSnapshot)) {
             end("The match snapshot from the host was damaged");
@@ -1744,13 +1744,13 @@ struct LockstepSession::Impl {
         localSubmittedNext = hostInputAckNext = joinTick;
         catchingUp = true;
         MEALKIT_INFO("Match snapshot received: catching up from tick %u as player %u", joinTick, localPlayer);
-        sendInput(); // 시작 확인 (호스트가 묶음을 보내기 시작한다)
+        sendInput(); // acknowledge the start (the host starts sending bundles)
     }
 
     void clientUpdate() {
         Peer& h = peers[0];
         if (h.lastRecv < 0.0) h.lastRecv = now;
-        if (lastUpdate >= 0.0 && now - lastUpdate > kUpdateGap) { // 내가 멈춰 있었다 (로딩): 그동안은 호스트 침묵으로 세지 않는다
+        if (lastUpdate >= 0.0 && now - lastUpdate > kUpdateGap) { // I was stalled (loading): that time isn't counted as host silence
             h.lastRecv += now - lastUpdate;
             lastBundle += now - lastUpdate;
         }
@@ -1763,21 +1763,21 @@ struct LockstepSession::Impl {
             if (now - h.lastRecv > kTimeout) end("Could not reach the host");
             return;
         }
-        // 호스트가 조용하다: 매치가 흐르는 중이면 짧게, 로비·로딩(호스트가 몇 초 멈출 수 있다)은 길게. 승계 목록의 다음 사람에게 넘어간다
+        // The host is silent: short timeout while the match flows, long in lobby/loading (the host may stall for seconds). Hand over to the next person on the succession list
         const f64 lost = state == SessionState::Running && matchFlowing ? kHostLost : kTimeout;
         if (now - h.lastRecv > lost) {
             migrate("timed out");
             if (host || state == SessionState::Ended) return;
         }
         if (state == SessionState::Lobby) {
-            if (now - h.lastControlSend >= 1.0) { // 로비 유지 신호 (로드아웃·이름·준비)
+            if (now - h.lastControlSend >= 1.0) { // lobby keepalive signal (loadout/name/ready)
                 sendConnect();
                 h.lastControlSend = now;
             }
             clientChat();
             return;
         }
-        if (state == SessionState::Running && now - lastBundle > kHostSilence) waitMask |= 1u << hostPlayer; // 호스트에게서 아무것도 오지 않는다
+        if (state == SessionState::Running && now - lastBundle > kHostSilence) waitMask |= 1u << hostPlayer; // nothing is coming from the host
         if (state == SessionState::Running && (sendPending || now - h.lastSend >= kKeepAliveInterval)) {
             sendInput();
             sendPending = false;
@@ -1818,7 +1818,7 @@ bool LockstepSession::requestInputDelay(u32 ticks) { return m->queueDelay(ticks)
 
 u32 delayForRtt(f32 rttMs, const AutoDelay& a) {
     const f32 tickMs = a.tickMs > 0.0f ? a.tickMs : 1000.0f / 30.0f;
-    const f32 needMs = rttMs * 1.25f + tickMs; // 왕복(호스트를 거친 가장 먼 길) + 흔들림 여유 + 처리 한 틱
+    const f32 needMs = rttMs * 1.25f + tickMs; // round trip (the longest path via the host) + jitter margin + one processing tick
     const u32 ticks = static_cast<u32>(std::ceil(needMs / tickMs));
     return std::clamp(ticks, std::max(1u, a.minTicks), std::max(a.minTicks, a.maxTicks));
 }
@@ -1921,7 +1921,7 @@ bool LockstepSession::setLocalLoadout(const void* data, u32 size) {
     const std::vector<u8> next(bytes, bytes + size);
     if (next == m->localLoadout) return true;
     m->localLoadout = next;
-    if (!m->host && !m->peers.empty()) m->peers[0].lastControlSend = -1.0; // 로비에 있으면 바로 다시 보낸다
+    if (!m->host && !m->peers.empty()) m->peers[0].lastControlSend = -1.0; // if in the lobby, resend right away
     return true;
 }
 
@@ -1950,17 +1950,17 @@ const std::vector<LobbyMember>& LockstepSession::lobbyMembers() const { return m
 
 void LockstepSession::startMatch(u64 seed, u32 matchData) {
     if (!m->host || m->state != SessionState::Lobby) return;
-    m->localPlayer = m->hostPlayer = 0; // 이어받은 호스트도 새 매치에서는 0번
-    m->rebuildMembers(); // 시작할 때의 목록 (매치 중에 보인다)
+    m->localPlayer = m->hostPlayer = 0; // a successor host is also index 0 in a new match
+    m->rebuildMembers(); // list at start (shown during the match)
     m->playerCount = 1 + static_cast<u32>(m->peers.size());
     for (std::vector<u8>& l : m->loadouts) l.clear();
     m->loadouts[0] = m->localLoadout;
-    // 빈 번호 없이 다시 매긴다 (로비에서 나간 사람이 있으면 번호가 비어 있다)
+    // Renumber without gaps (indices are empty if someone left the lobby)
     for (size_t i = 0; i < m->peers.size(); ++i) m->loadouts[i + 1] = m->peers[i].loadout;
     for (size_t i = 0; i < m->members.size(); ++i) m->members[i].player = static_cast<u8>(i);
     m->seed = seed;
     m->matchData = matchData;
-    if (m->autoDelay.enabled && !m->offline) { // 로비에서 잰 왕복 시간으로
+    if (m->autoDelay.enabled && !m->offline) { // from round-trip times measured in the lobby
         m->inputDelay = m->desiredDelay();
         MEALKIT_INFO("Input delay %u ticks (automatic, worst round trip %.0f ms)", m->inputDelay,
                      m->peers.empty() ? 0.0 : static_cast<f64>(std::max_element(m->peers.begin(), m->peers.end(), [](const Peer& a, const Peer& b) {
@@ -1993,7 +1993,7 @@ void LockstepSession::returnToLobby() {
     for (Peer& p : m->peers) {
         p.ready = false;
         p.started = false;
-        p.lastControlSend = -1.0; // 로비 신호를 바로 보낸다 (클라이언트는 이것을 받고 로비로)
+        p.lastControlSend = -1.0; // send the lobby signal right away (clients go to the lobby on receiving it)
     }
     m->rebuildMembers();
     MEALKIT_INFO("Back to the lobby after match %u", m->matchIndex);
@@ -2037,9 +2037,9 @@ void LockstepSession::update(f64 now) {
 
 void LockstepSession::shutdown() {
     if (m->state == SessionState::Connecting || m->state == SessionState::Lobby || m->state == SessionState::Running) {
-        // 호스트가 나간다: 남은 사람은 승계 목록대로 이어 간다 (호스트 이전). 끝내는 것은 end()의 Disconnect
+        // The host is leaving: the rest continue per the succession list (host migration). Ending is end()'s Disconnect
         const bool handoff = m->host && !m->offline && !m->peers.empty() && m->state != SessionState::Connecting;
-        if (handoff) m->sendSuccession(); // 마지막 목록 (Handoff보다 먼저 닿게)
+        if (handoff) m->sendSuccession(); // the final list (so it arrives before the Handoff)
         Writer w;
         header(w, handoff ? Packet::Handoff : Packet::Disconnect);
         for (const Peer& p : m->peers) {
@@ -2068,7 +2068,7 @@ void LockstepSession::reset() {
     fresh->autoDelay = m->autoDelay;
     fresh->localName = m->localName;
     fresh->localLoadout = m->localLoadout;
-    fresh->localToken = m->localToken; // 같은 사람: 다시 들어가면 예전 슬롯
+    fresh->localToken = m->localToken; // same person: rejoining gets the old slot
     delete m;
     m = fresh;
 }
@@ -2112,13 +2112,13 @@ void LockstepSession::tickExecuted(u32 tick, u64 stateHash) {
         }
         return;
     }
-    forEachCommand(m->slot(tick).inputs, [&](u8 player, const u8* data, u32 size) { // 엔진 명령: 입력 지연 변경, 접속·끊김
+    forEachCommand(m->slot(tick).inputs, [&](u8 player, const u8* data, u32 size) { // engine commands: input delay change, connect/disconnect
         u32 type = 0;
         if (size >= 5) std::memcpy(&type, data, 4);
         if (size == 5 && type == kDelayCommandType) m->applyDelay(tick, data[4]);
         if (size >= 5 && type == kPresenceCommandType) m->applyPresence(player, data[4] != 0, data + 5, size - 5);
     });
-    if (m->catchingUp && tick + 1 + kCaughtUpTicks >= m->finalNext) { // 따라잡았다: 다음 내 입력부터 보낸다
+    if (m->catchingUp && tick + 1 + kCaughtUpTicks >= m->finalNext) { // caught up: send from my next input
         m->catchingUp = false;
         m->localSubmittedNext = m->hostInputAckNext = tick + m->inputDelay;
         MEALKIT_INFO("Caught up with the match at tick %u", tick);
@@ -2138,16 +2138,16 @@ void LockstepSession::submitLocalInput(u32 tick, const PlayerInput& input) {
     if (m->state != SessionState::Running || m->replay || m->catchingUp) return;
     m->lastLocalInput = input;
     if (m->host) {
-        if (tick < m->finalNext) return; // 지연이 줄어 이미 낸 틱 (확정된 것은 바꾸지 않는다)
+        if (tick < m->finalNext) return; // a tick already submitted because the delay shrank (confirmed ones aren't changed)
         Slot& s = m->claim(tick);
         if (s.mask & (1u << m->localPlayer)) return;
         s.inputs.players[m->localPlayer] = input;
         s.mask |= 1u << m->localPlayer;
         if (m->finalize() && !m->offline) {
-            for (Peer& p : m->peers) m->sendBundle(p); // 확정되면 바로 배포 (지연 최소화)
+            for (Peer& p : m->peers) m->sendBundle(p); // distribute as soon as confirmed (minimizes delay)
         }
     } else {
-        if (tick < m->localSubmittedNext) return; // 지연이 줄어 이미 낸 틱
+        if (tick < m->localSubmittedNext) return; // a tick already submitted because the delay shrank
         m->localInputs[tick % kTickWindow] = input;
         m->localSubmittedNext = std::max(m->localSubmittedNext, tick + 1);
         m->sendInput();
@@ -2161,7 +2161,7 @@ u32 LockstepSession::hostMigrations() const { return m->migrations; }
 Address LockstepSession::hostAddress() const { return m->host || m->peers.empty() ? Address{} : m->peers[0].address; }
 
 Address LockstepSession::successorAddress() const {
-    // 플레이어 번호 순의 첫 클라이언트 (승계 목록의 다음 사람)
+    // First client in player index order (the next person on the succession list)
     return !m->host || m->peers.empty() ? Address{} : m->peers[0].address;
 }
 
@@ -2175,7 +2175,7 @@ void LockstepSession::provideSnapshot(u32 tick, const std::vector<u8>& bytes) {
         MEALKIT_ERROR("Could not compress the join snapshot");
         return;
     }
-    // 따라잡을 확정 틱: 스냅샷 틱부터 (링 버퍼에 아직 있다)
+    // Confirmed ticks to catch up on: from the snapshot tick (still in the ring buffer)
     if (!m->joinLogging || tick < m->joinLogBase) {
         m->joinLog.clear();
         m->joinLogBase = tick;
@@ -2237,13 +2237,13 @@ bool LockstepSession::sendChat(const std::string& text) {
     if (line.empty() || m->now - m->lastLocalChat < kChatInterval) return false;
     m->lastLocalChat = m->now;
     const std::string name = m->displayName(m->localName, m->localPlayer);
-    if (m->host) { // 혼자 플레이도 여기 (자기 로그에만)
+    if (m->host) { // solo play also comes here (only into its own log)
         m->relayChat(m->localPlayer, name, line);
         return true;
     }
     if (m->outChat.size() >= kMaxOutChat) return false;
     m->outChat.push_back({m->nextChatSeq++, line});
-    m->lastChatSend = -1.0; // 바로 보낸다
+    m->lastChatSend = -1.0; // send right away
     return true;
 }
 

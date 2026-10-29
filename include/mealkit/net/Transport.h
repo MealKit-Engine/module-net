@@ -6,14 +6,14 @@
 
 namespace mealkit::net {
 
-// 패킷 전송 계층. 락스텝 세션은 이 인터페이스만 쓴다.
-//   UdpTransport   : IP/포트 직접 (LAN, 개발, 같은 PC 테스트)
-//   플랫폼 릴레이  : online::Service::createTransport() (Steam ID + Steam 릴레이 등, mealkit/online/Online.h)
+// Packet transport layer. The lockstep session uses only this interface.
+//   UdpTransport   : IP/port directly (LAN, development, same-PC tests)
+//   platform relay : online::Service::createTransport() (Steam ID + Steam relay etc., mealkit/online/Online.h)
 class Transport {
 public:
     virtual ~Transport() = default;
     virtual bool send(const Address& to, const void* data, u32 size) = 0;
-    virtual i32 receive(Address& from, void* buffer, u32 capacity) = 0; // 받을 것이 없으면 -1
+    virtual i32 receive(Address& from, void* buffer, u32 capacity) = 0; // -1 if there's nothing to receive
 };
 
 class UdpTransport final : public Transport {

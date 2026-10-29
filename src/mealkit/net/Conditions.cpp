@@ -26,7 +26,7 @@ public:
 
     bool send(const Address& to, const void* data, u32 size) override {
         flushOut();
-        if (drop()) return true; // 보낸 것처럼 (UDP는 원래 알 수 없다)
+        if (drop()) return true; // as if sent (UDP can't know anyway)
         m_out.push_back({nowSeconds() + delay(), to, {static_cast<const u8*>(data), static_cast<const u8*>(data) + size}});
         flushOut();
         return true;
@@ -37,7 +37,7 @@ public:
         u8 packet[2048];
         Address source;
         i32 n;
-        while ((n = m_inner->receive(source, packet, sizeof(packet))) >= 0) // 받은 것을 모두 지연 큐로
+        while ((n = m_inner->receive(source, packet, sizeof(packet))) >= 0) // everything received goes to the delay queue
             if (!drop()) m_in.push_back({nowSeconds() + delay(), source, {packet, packet + n}});
         const f64 now = nowSeconds();
         auto due = std::min_element(m_in.begin(), m_in.end(), [](const Delayed& a, const Delayed& b) { return a.due < b.due; });
@@ -51,7 +51,7 @@ public:
 
 private:
     bool drop() { return m_c.lossPercent > 0.0f && m_rng.next01() * 100.0f < m_c.lossPercent; }
-    // 한 방향 지연 (초): 왕복의 반 + 흔들림
+    // One-way delay (seconds): half the round trip + jitter
     f64 delay() { return (m_c.lagMs * 0.5f + m_rng.next01() * m_c.jitterMs) / 1000.0; }
 
     void flushOut() {
@@ -68,7 +68,7 @@ private:
 
     std::unique_ptr<Transport> m_inner;
     NetConditions m_c;
-    Pcg32 m_rng; // 시뮬레이션 밖 (전달 시점만 바꾼다)
+    Pcg32 m_rng; // outside the simulation (only changes delivery timing)
     std::vector<Delayed> m_out, m_in;
 };
 

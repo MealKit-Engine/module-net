@@ -90,7 +90,7 @@ void RoomAnnouncer::update(f64 now, const RoomAnnouncement& room) {
     putText(packet, room.group);
     const u32 size = static_cast<u32>(packet.size());
     if (m_broadcast) m_socket.sendTo({kBroadcastIp, kRoomPort}, packet.data(), size);
-    m_socket.sendTo({kLoopbackIp, kRoomPort}, packet.data(), size); // 같은 PC (브로드캐스트가 돌아오지 않는 환경)
+    m_socket.sendTo({kLoopbackIp, kRoomPort}, packet.data(), size); // same PC (environments where broadcasts don't loop back)
 }
 
 bool RoomFinder::open(const std::string& game) {
@@ -133,7 +133,7 @@ void RoomFinder::update(f64 now) {
         if (!r.ok || room.game != m_game) continue;
         room.address = {from.ip, room.port};
         room.lastSeen = now;
-        // 같은 방이 브로드캐스트와 127.0.0.1로 두 번 온다: 같은 PC의 방이면 LAN 주소를 남긴다
+        // The same room arrives twice via broadcast and 127.0.0.1: for a room on the same PC, keep the LAN address
         auto same = [&](const Room& e) {
             return e.port == room.port && e.hostName == room.hostName && e.contentHash == room.contentHash &&
                    (e.address.ip == room.address.ip || e.address.ip == kLoopbackIp || room.address.ip == kLoopbackIp);
