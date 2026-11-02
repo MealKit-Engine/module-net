@@ -22,6 +22,8 @@ struct RoomAnnouncement {
     u64 simVersion = 0;   // simulation version (game::BuildInfo, net::buildId if 0)
     std::string version;  // game version (display only)
     std::string group;    // determinism group (net::determinismGroup)
+    std::string platform; // host OS (net::platformName)
+    bool crossplay = true; // the host allows other OSes
     u64 contentHash = 0;
     u16 port = 0;         // lockstep session port
     u8 players = 0, maxPlayers = 0;

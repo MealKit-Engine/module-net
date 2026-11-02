@@ -86,11 +86,16 @@ struct SessionStats {
 };
 
 // One person in the lobby (collected by the host and distributed via lobby signals)
+// Device a player plays with (shown in the lobby; crossplay matches mix platforms). Information only: the simulation sees quantized input
+enum class InputKind : u8 { KeyboardMouse, Gamepad, Touch };
+const char* inputKindName(InputKind kind); // "keyboard/mouse", "gamepad", "touch" (English, logs)
+
 struct LobbyMember {
     u8 player = 0;  // player index (host 0). Renumbered without gaps when the match starts
     std::string name;
     bool ready = false;
     bool host = false;
+    InputKind input = InputKind::KeyboardMouse;
     u32 pingMs = 0; // round-trip time to the host (measured by the host, 0 for the host itself)
     std::vector<u8> loadout; // match start data that person picked (read with game::readLobbyLoadout)
 };
@@ -118,17 +123,22 @@ u32 buildId();
 // Determinism group: compiler and CPU ("msvc-x64", "clang-x64", "clang-arm64" ...). Until cross-platform determinism is verified (stage 5)
 // peers in a different group are rejected
 const char* determinismGroup();
+// Operating system ("windows", "linux", "macos", ...): players who turn crossplay off only meet peers of the same one
+const char* platformName();
 
 // Content hash components (compared separately to report rejection reasons): order of game::MatchData::contentParts
 enum class ContentPart : u8 { Scene, Models, Tuning, Project, Tables, Count };
 
 // Connection rejection reason (client, rejectInfo())
-enum class RejectReason : u8 { None, Version, Platform, Content, Full, InProgress };
+// Input: the host only takes players with its own input kind (setSameInputOnly). Crossplay: another OS and one side turned crossplay off
+enum class RejectReason : u8 { None, Version, Platform, Content, Full, InProgress, Input, Crossplay };
 struct RejectInfo {
     RejectReason reason = RejectReason::None;
     u32 contentMask = 0;     // Content: differing components (bit = ContentPart)
     std::string hostVersion; // Version: the host's game version
     std::string hostGroup;   // Platform: the host's determinism group
+    std::string hostPlatform; // Crossplay: the host's OS (platformName)
+    InputKind hostInput = InputKind::KeyboardMouse; // Input: the host's input kind
 };
 
 class LockstepSession {
@@ -149,6 +159,11 @@ public:
     const RejectInfo& rejectInfo() const;
     // Host: accept peers with different executables too. Only for compiler comparison tests (mp_test -ClientExe). Desyncs may happen.
     void setAcceptOtherBuilds(bool accept);
+    // Host: reject joiners whose input kind differs from the host's (project setting mixInputKinds off). Players already in the room stay
+    void setSameInputOnly(bool sameOnly);
+    // Player setting: false = only peers on the same OS (platformName). Either side turning it off is enough to reject
+    void setCrossplay(bool allowed);
+    bool crossplay() const;
     // Network condition simulation (delay/jitter/loss, mealkit/net/Conditions.h): before host/join. For tests
     void setConditions(const NetConditions& conditions);
     // Host: automatic input delay adjustment (host's inputDelay is the initial value). The value changed mid-match is inputDelay()
@@ -181,6 +196,9 @@ public:
     const std::string& localName() const;
     void setLocalReady(bool ready);
     bool localReady() const;
+    // My input device (sent in lobby signals, immediately when changed; the host's roster carries everyone's)
+    void setLocalInputKind(InputKind kind);
+    InputKind localInputKind() const;
     // People in the lobby (player index order, including the host). During a match, the list at start
     const std::vector<LobbyMember>& lobbyMembers() const;
     // Host only: lobby → running. Sends seed and matchData (match setting decided by the game) to everyone.

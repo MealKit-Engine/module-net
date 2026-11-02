@@ -74,6 +74,14 @@ using Reject = RejectReason;
 
 constexpr u8 kMemberReady = 1;
 constexpr u8 kMemberHost = 2;
+constexpr u8 kMemberInputShift = 2; // bits 2..3: InputKind
+constexpr u8 kMemberInputMask = 3;
+
+u8 inputBits(InputKind kind) { return static_cast<u8>(static_cast<u8>(kind) << kMemberInputShift); }
+InputKind inputOf(u8 flags) {
+    const u8 v = (flags >> kMemberInputShift) & kMemberInputMask;
+    return v <= static_cast<u8>(InputKind::Touch) ? static_cast<InputKind>(v) : InputKind::KeyboardMouse;
+}
 
 u32 toMs(f64 seconds) { return static_cast<u32>(seconds * 1000.0) + 1; } // 0 means "none"
 
@@ -84,6 +92,8 @@ const char* rejectText(Reject r) {
     case Reject::Full: return "Session is full";
     case Reject::InProgress: return "Match already in progress";
     case Reject::Content: return "Host uses different game data";
+    case Reject::Input: return "Host only takes players with its input kind";
+    case Reject::Crossplay: return "Crossplay is off and the host runs another operating system";
     case Reject::None: break;
     }
     return "Connection rejected";
@@ -177,6 +187,7 @@ struct Peer {
     std::vector<u8> loadout;    // host: this client's match start data received in the lobby
     std::string name;           // host: lobby name
     bool ready = false;         // host: lobby ready
+    InputKind input = InputKind::KeyboardMouse; // host: input device sent in the lobby signal
     u32 chatNext = 0;           // host: next number of chat received from this client
     u32 relayNext = 0;          // host: next number of relayed chat this client acknowledged
     bool chatAckDirty = false;  // host: needs to acknowledge received chat
@@ -233,6 +244,22 @@ struct RelayChat { // host: chat distributed to everyone (in number order)
 };
 
 } // namespace
+
+const char* platformName() {
+#if defined(__ANDROID__)
+    return "android";
+#elif defined(__EMSCRIPTEN__)
+    return "web";
+#elif defined(__APPLE__)
+    return "macos";
+#elif defined(__linux__)
+    return "linux";
+#elif defined(_WIN32)
+    return "windows";
+#else
+    return "other";
+#endif
+}
 
 const char* determinismGroup() {
 #if defined(__clang__)
@@ -319,6 +346,9 @@ struct LockstepSession::Impl {
     // Lobby
     std::string localName;
     bool localReady = false;
+    InputKind localInput = InputKind::KeyboardMouse;
+    bool sameInputOnly = false; // host: reject joiners with another input kind
+    bool crossplay = true;      // false: peers on another OS are rejected
     std::vector<LobbyMember> members; // host: rebuilt every update / client: from lobby signals
     std::vector<f64> memberSeen;      // client: last receive time per member (removes people who left)
     u32 memberCursor = 0;             // host: if not everything fits in a lobby signal, the next signal starts here
@@ -673,6 +703,7 @@ struct LockstepSession::Impl {
         self.name = displayName(localName, localPlayer);
         self.ready = true; // the host is the one who starts
         self.host = true;
+        self.input = localInput;
         self.loadout = localLoadout;
         members.push_back(std::move(self));
         for (const Peer& p : peers) {
@@ -680,6 +711,7 @@ struct LockstepSession::Impl {
             entry.player = p.playerId;
             entry.name = displayName(p.name, p.playerId);
             entry.ready = p.ready;
+            entry.input = p.input;
             entry.pingMs = static_cast<u32>(p.rttMs + 0.5f);
             entry.loadout = p.loadout;
             members.push_back(std::move(entry));
@@ -705,6 +737,8 @@ struct LockstepSession::Impl {
         w.put(contentMask);
         w.text(gameVersion);
         w.text(determinismGroup());
+        w.text(platformName());
+        w.put(static_cast<u8>(localInput));
         send(to, w);
     }
 
@@ -725,7 +759,7 @@ struct LockstepSession::Impl {
             if (w.size + need > kMaxPacket) break;
             w.put(entry.player);
             w.put(static_cast<u16>(std::min<u32>(entry.pingMs, 0xFFFF)));
-            w.put(static_cast<u8>((entry.ready ? kMemberReady : 0) | (entry.host ? kMemberHost : 0)));
+            w.put(static_cast<u8>((entry.ready ? kMemberReady : 0) | (entry.host ? kMemberHost : 0) | inputBits(entry.input)));
             w.text(entry.name);
             w.put(static_cast<u8>(entry.loadout.size()));
             w.bytes(entry.loadout.data(), static_cast<u32>(entry.loadout.size()));
@@ -926,6 +960,8 @@ struct LockstepSession::Impl {
             std::string name = r.text(kMaxNameBytes);
             const u32 hostEcho = r.get<u32>();
             const u64 token = r.get<u64>();
+            const std::string platform = r.text(16);
+            const bool peerCrossplay = r.get<u8>() != 0;
             if (!r.ok) return;
             // Must be the same simulation: determinism group (compiler/CPU) → simulation version (game version + simulation source) → game data
             if (group != determinismGroup() || build != mySimVersion()) {
@@ -942,9 +978,18 @@ struct LockstepSession::Impl {
                 sendReject(from, Reject::Content, mask);
                 return;
             }
+            if (platform != platformName() && (!crossplay || !peerCrossplay)) {
+                sendReject(from, Reject::Crossplay);
+                return;
+            }
+            if (!peer && sameInputOnly && inputOf(flags) != localInput) { // new joiners only: switching devices in the room doesn't kick
+                sendReject(from, Reject::Input);
+                return;
+            }
             if (!peer && state == SessionState::Running) {
                 peer = acceptLate(from, token, name, loadout);
                 if (!peer) return;
+                peer->input = inputOf(flags);
             }
             if (!peer) {
                 if (state != SessionState::Lobby) {
@@ -971,6 +1016,7 @@ struct LockstepSession::Impl {
                 peer->loadout = std::move(loadout);
                 peer->name = std::move(name);
                 peer->ready = (flags & kMemberReady) != 0;
+                peer->input = inputOf(flags);
             }
             sendAccept(*peer);
             break;
@@ -1245,10 +1291,12 @@ struct LockstepSession::Impl {
         for (u64 part : contentParts) w.put(part);
         w.put(static_cast<u8>(localLoadout.size()));
         w.bytes(localLoadout.data(), static_cast<u32>(localLoadout.size()));
-        w.put(static_cast<u8>(localReady ? kMemberReady : 0));
+        w.put(static_cast<u8>((localReady ? kMemberReady : 0) | inputBits(localInput)));
         w.text(localName);
         w.put(peers[0].hostEcho);
         w.put(localToken);
+        w.text(platformName());
+        w.put(static_cast<u8>(crossplay ? 1 : 0));
         send(peers[0].address, w);
     }
 
@@ -1377,7 +1425,10 @@ struct LockstepSession::Impl {
             p.commandNext = p.chatNext = kUnknownSeq;
             p.heard = false;
             for (const LobbyMember& member : members)
-                if (member.player == e.player) p.loadout = member.loadout;
+                if (member.player == e.player) {
+                    p.loadout = member.loadout;
+                    p.input = member.input;
+                }
             next.push_back(std::move(p));
         }
         peers = std::move(next);
@@ -1476,6 +1527,8 @@ struct LockstepSession::Impl {
             rejectInfo.contentMask = r.get<u32>();
             rejectInfo.hostVersion = r.text(64);
             rejectInfo.hostGroup = r.text(32);
+            rejectInfo.hostPlatform = r.text(16);
+            rejectInfo.hostInput = static_cast<InputKind>(std::min<u8>(r.get<u8>(), static_cast<u8>(InputKind::Touch)));
             std::string reason = rejectText(rejectInfo.reason);
             if (rejectInfo.reason == Reject::Version) reason += " (yours " + gameVersion + ", host " + rejectInfo.hostVersion + ")";
             if (rejectInfo.reason == Reject::Platform) reason += " (yours " + std::string(determinismGroup()) + ", host " + rejectInfo.hostGroup + ")";
@@ -1515,6 +1568,7 @@ struct LockstepSession::Impl {
                 if (!r.ok) break;
                 entry.ready = (flags & kMemberReady) != 0;
                 entry.host = (flags & kMemberHost) != 0;
+                entry.input = inputOf(flags);
                 size_t at = 0;
                 while (at < members.size() && members[at].player != entry.player) ++at;
                 if (at == members.size()) {
@@ -1946,6 +2000,30 @@ void LockstepSession::setLocalReady(bool ready) {
 }
 
 bool LockstepSession::localReady() const { return m->localReady; }
+
+void LockstepSession::setLocalInputKind(InputKind kind) {
+    if (kind == m->localInput) return;
+    m->localInput = kind;
+    if (!m->host && !m->peers.empty()) m->peers[0].lastControlSend = -1.0;
+}
+
+InputKind LockstepSession::localInputKind() const { return m->localInput; }
+void LockstepSession::setSameInputOnly(bool sameOnly) { m->sameInputOnly = sameOnly; }
+void LockstepSession::setCrossplay(bool allowed) {
+    if (allowed == m->crossplay) return;
+    m->crossplay = allowed;
+    if (!m->host && !m->peers.empty()) m->peers[0].lastControlSend = -1.0;
+}
+bool LockstepSession::crossplay() const { return m->crossplay; }
+
+const char* inputKindName(InputKind kind) {
+    switch (kind) {
+    case InputKind::KeyboardMouse: return "keyboard/mouse";
+    case InputKind::Gamepad: return "gamepad";
+    case InputKind::Touch: return "touch";
+    }
+    return "?";
+}
 const std::vector<LobbyMember>& LockstepSession::lobbyMembers() const { return m->members; }
 
 void LockstepSession::startMatch(u64 seed, u32 matchData) {

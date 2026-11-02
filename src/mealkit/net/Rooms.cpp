@@ -88,6 +88,8 @@ void RoomAnnouncer::update(f64 now, const RoomAnnouncement& room) {
     putText(packet, room.hostName);
     putText(packet, room.version);
     putText(packet, room.group);
+    putText(packet, room.platform);
+    putValue(packet, static_cast<u8>(room.crossplay ? 1 : 0));
     const u32 size = static_cast<u32>(packet.size());
     if (m_broadcast) m_socket.sendTo({kBroadcastIp, kRoomPort}, packet.data(), size);
     m_socket.sendTo({kLoopbackIp, kRoomPort}, packet.data(), size); // same PC (environments where broadcasts don't loop back)
@@ -130,6 +132,8 @@ void RoomFinder::update(f64 now) {
         room.hostName = r.text();
         room.version = r.text();
         room.group = r.text();
+        room.platform = r.text();
+        room.crossplay = r.get<u8>() != 0;
         if (!r.ok || room.game != m_game) continue;
         room.address = {from.ip, room.port};
         room.lastSeen = now;
