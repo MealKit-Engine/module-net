@@ -8,7 +8,7 @@
 
 // LAN room search (ROADMAP stage 1 "LAN room search"): join on the same router without sharing an IP.
 //   During the lobby, the host sends room announcements (game name, build/content hash, player count, port, host name) every second to the whole network (broadcast)
-//   and to 127.0.0.1 (same-PC tests). The join menu listens on kRoomPort shared with others (multiple games on the same PC) and collects only rooms of the same game name.
+//   and to 127.0.0.1 + 127.255.255.255 (same PC; Linux gives a unicast to only one of the shared sockets). The join menu listens on kRoomPort shared with others (multiple games on the same PC) and collects only rooms of the same game name.
 //   Outside matches, so unrelated to determinism. Uses only platform layer sockets.
 namespace mealkit::net {
 

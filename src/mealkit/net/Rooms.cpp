@@ -58,7 +58,7 @@ bool RoomAnnouncer::open(bool broadcast) {
     if (!startup()) return false;
     m_started = true;
     m_broadcast = broadcast;
-    if (!m_socket.open(0, !broadcast) || (broadcast && !m_socket.enableBroadcast())) {
+    if (!m_socket.open(0, !broadcast) || !m_socket.enableBroadcast()) { // broadcast also for kLoopbackBroadcastIp
         MEALKIT_WARN("LAN rooms: cannot open the announce socket");
         close();
         return false;
@@ -93,6 +93,8 @@ void RoomAnnouncer::update(f64 now, const RoomAnnouncement& room) {
     const u32 size = static_cast<u32>(packet.size());
     if (m_broadcast) m_socket.sendTo({kBroadcastIp, kRoomPort}, packet.data(), size);
     m_socket.sendTo({kLoopbackIp, kRoomPort}, packet.data(), size); // same PC (environments where broadcasts don't loop back)
+    // Linux hands a unicast packet to only one of the sockets sharing kRoomPort (SO_REUSEPORT), so same-PC finders also get a loopback broadcast
+    m_socket.sendTo({kLoopbackBroadcastIp, kRoomPort}, packet.data(), size);
 }
 
 bool RoomFinder::open(const std::string& game) {
