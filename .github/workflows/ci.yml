@@ -1,0 +1,7 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  module:
+    uses: MealKit-Engine/MealKit/.github/workflows/engine-module.yml@v1
+    with:
+      modules: "net"
