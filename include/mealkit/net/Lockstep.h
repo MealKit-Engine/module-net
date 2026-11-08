@@ -3,6 +3,7 @@
 #include "mealkit/core/Types.h"
 #include "mealkit/net/Conditions.h"
 #include "mealkit/net/Transport.h"
+#include "mealkit/session/Session.h"
 
 #include <memory>
 #include <string>
@@ -35,77 +36,31 @@
 // Direct UDP is only guaranteed on LAN since clients have never connected to each other (Steam/EOS use account ids, so anywhere).
 namespace mealkit::net {
 
-inline constexpr u32 kMaxPlayers = 8;
-inline constexpr u32 kInputBytes = 8;   // player input size defined by the game (per tick)
-inline constexpr u32 kTickWindow = 256; // range of ticks that can be handled at once (about 8.5 seconds at 30Hz)
-inline constexpr u32 kMaxCommandBytes = 200;     // max size of one command
-inline constexpr u32 kCommandBytesPerTick = 256; // commands carried per tick (including a 2-byte header per command)
-inline constexpr u32 kMaxLoadoutBytes = 128;     // match start data per player (so 8 players fit in one start packet)
-inline constexpr u32 kMaxNameBytes = 24;         // player name shown in the lobby (UTF-8, cut by character if longer)
-inline constexpr u32 kMaxChatBytes = 120;        // one chat line (UTF-8)
-inline constexpr u32 kChatLogSize = 50;          // number of lines chatLog() keeps
-inline constexpr f64 kChatInterval = 0.5;        // minimum interval between my chat lines (seconds)
-// Engine confirmed command name (command type = fnv1a of the name): player connect/disconnect. Contents [connected u8][loadout bytes], sending player = that slot
-inline constexpr const char* kPresenceCommand = "mealkit.net.Presence";
-
-struct PlayerInput {
-    u8 bytes[kInputBytes] = {};
-};
-
-struct TickInputs {
-    PlayerInput players[kMaxPlayers];
-    u16 commandBytes = 0;                     // bytes used in commands
-    u8 commands[kCommandBytesPerTick] = {};   // repeated [player u8][size u8][contents] (read with forEachCommand)
-};
-
-// This tick's confirmed commands: f(player, contents, size)
-template <class F>
-void forEachCommand(const TickInputs& in, F&& f) {
-    u32 i = 0;
-    while (i + 2 <= in.commandBytes) {
-        const u8 player = in.commands[i];
-        const u32 size = in.commands[i + 1];
-        if (i + 2 + size > in.commandBytes) break;
-        f(player, in.commands + i + 2, size);
-        i += 2 + size;
-    }
-}
-
-enum class SessionState : u8 {
-    Idle,       // before start
-    Connecting, // client: connecting to the host
-    Lobby,      // waiting for match start
-    Running,    // simulation in progress
-    Ended,      // ended (see endReason)
-};
-
-struct SessionStats {
-    f32 rttMs = 0.0f; // client: round-trip time to the host
-    u32 sentBytesPerSec = 0;
-    u32 recvBytesPerSec = 0;
-};
-
-// One person in the lobby (collected by the host and distributed via lobby signals)
-// Device a player plays with (shown in the lobby; crossplay matches mix platforms). Information only: the simulation sees quantized input
-enum class InputKind : u8 { KeyboardMouse, Gamepad, Touch };
-const char* inputKindName(InputKind kind); // "keyboard/mouse", "gamepad", "touch" (English, logs)
-
-struct LobbyMember {
-    u8 player = 0;  // player index (host 0). Renumbered without gaps when the match starts
-    std::string name;
-    bool ready = false;
-    bool host = false;
-    InputKind input = InputKind::KeyboardMouse;
-    u32 pingMs = 0; // round-trip time to the host (measured by the host, 0 for the host itself)
-    std::vector<u8> loadout; // match start data that person picked (read with game::readLobbyLoadout)
-};
-
-struct ChatMessage {
-    u32 serial = 0; // order received in this session (from 1): lets the screen recognize new lines
-    u8 player = 0;
-    std::string name; // name at send time
-    std::string text;
-};
+// Shared types live in the session module (mealkit/session/Session.h); these names keep engine-side net code unchanged
+using session::ChatMessage;
+using session::clampUtf8;
+using session::ContentPart;
+using session::forEachCommand;
+using session::InputKind;
+using session::inputKindName;
+using session::kChatInterval;
+using session::kChatLogSize;
+using session::kCommandBytesPerTick;
+using session::kInputBytes;
+using session::kMaxChatBytes;
+using session::kMaxCommandBytes;
+using session::kMaxLoadoutBytes;
+using session::kMaxNameBytes;
+using session::kMaxPlayers;
+using session::kPresenceCommand;
+using session::kTickWindow;
+using session::LobbyMember;
+using session::PlayerInput;
+using session::RejectInfo;
+using session::RejectReason;
+using session::SessionState;
+using session::SessionStats;
+using session::TickInputs;
 
 // Automatic input delay adjustment (host): set at match start from round-trip times measured in the lobby, and changed 1 tick at a time mid-match from the same tick for everyone via an engine confirmed command
 struct AutoDelay {
@@ -126,22 +81,7 @@ const char* determinismGroup();
 // Operating system ("windows", "linux", "macos", ...): players who turn crossplay off only meet peers of the same one
 const char* platformName();
 
-// Content hash components (compared separately to report rejection reasons): order of game::MatchData::contentParts
-enum class ContentPart : u8 { Scene, Models, Tuning, Project, Tables, Count };
-
-// Connection rejection reason (client, rejectInfo())
-// Input: the host only takes players with its own input kind (setSameInputOnly). Crossplay: another OS and one side turned crossplay off
-enum class RejectReason : u8 { None, Version, Platform, Content, Full, InProgress, Input, Crossplay };
-struct RejectInfo {
-    RejectReason reason = RejectReason::None;
-    u32 contentMask = 0;     // Content: differing components (bit = ContentPart)
-    std::string hostVersion; // Version: the host's game version
-    std::string hostGroup;   // Platform: the host's determinism group
-    std::string hostPlatform; // Crossplay: the host's OS (platformName)
-    InputKind hostInput = InputKind::KeyboardMouse; // Input: the host's input kind
-};
-
-class LockstepSession {
+class LockstepSession final : public session::Session {
 public:
     LockstepSession();
     ~LockstepSession();
@@ -150,20 +90,20 @@ public:
 
     // Hash of game data (scene etc.). Set before host/join to reject connections from peers with different data.
     void setContentHash(u64 hash);
-    u64 contentHash() const;
+    u64 contentHash() const override;
     // Hash components (ContentPart order, Count items): tells what differs on rejection
     void setContentParts(const u64* parts);
     // This build's simulation version and game version (game::BuildInfo). Peers with a different simulation version are rejected (buildId if 0)
     void setBuild(u64 simVersion, const std::string& gameVersion);
     // Client: why the host rejected the connection (after Ended)
-    const RejectInfo& rejectInfo() const;
+    const RejectInfo& rejectInfo() const override;
     // Host: accept peers with different executables too. Only for compiler comparison tests (mp_test -ClientExe). Desyncs may happen.
     void setAcceptOtherBuilds(bool accept);
     // Host: reject joiners whose input kind differs from the host's (project setting mixInputKinds off). Players already in the room stay
     void setSameInputOnly(bool sameOnly);
     // Player setting: false = only peers on the same OS (platformName). Either side turning it off is enough to reject
     void setCrossplay(bool allowed);
-    bool crossplay() const;
+    bool crossplay() const override;
     // Network condition simulation (delay/jitter/loss, mealkit/net/Conditions.h): before host/join. For tests
     void setConditions(const NetConditions& conditions);
     // Host: automatic input delay adjustment (host's inputDelay is the initial value). The value changed mid-match is inputDelay()
@@ -178,8 +118,8 @@ public:
     // My inputs/commands are discarded. If hashes are given, they're compared in tickExecuted and the first differing tick is reported as a desync (desynced/desyncTick)
     bool startReplay(u64 seed, u32 matchData, const std::vector<std::vector<u8>>& loadouts,
                      std::vector<TickInputs> inputs, std::vector<u64> hashes);
-    bool isReplay() const;
-    u32 replayTicks() const; // number of recorded ticks (0 if not a replay)
+    bool isReplay() const override;
+    u32 replayTicks() const override; // number of recorded ticks (0 if not a replay)
     // loopbackOnly: for same-PC tests (no firewall prompt)
     bool host(u16 port, u32 maxPlayers, u32 inputDelay, bool loopbackOnly = false);
     bool join(const Address& hostAddress);
@@ -188,87 +128,84 @@ public:
     bool joinWith(std::unique_ptr<Transport> transport, const Address& hostAddress);
     // Match start data (per-player loadout, mealkit/game/Loadout.h): decided before the match. Clients send it in lobby signals (every second),
     // and the host confirms everyone's at startMatch and distributes it in the start packet. Size up to kMaxLoadoutBytes (false if over)
-    bool setLocalLoadout(const void* data, u32 size);
+    bool setLocalLoadout(const void* data, u32 size) override;
     // Confirmed loadouts (after Running, per player index. Empty if not sent)
-    const std::vector<u8>& loadout(u32 player) const;
+    const std::vector<u8>& loadout(u32 player) const override;
     // My name shown in the lobby (up to kMaxNameBytes) and ready. Clients send them in lobby signals (immediately when changed)
-    void setLocalName(const std::string& name);
-    const std::string& localName() const;
-    void setLocalReady(bool ready);
-    bool localReady() const;
+    void setLocalName(const std::string& name) override;
+    const std::string& localName() const override;
+    void setLocalReady(bool ready) override;
+    bool localReady() const override;
     // My input device (sent in lobby signals, immediately when changed; the host's roster carries everyone's)
-    void setLocalInputKind(InputKind kind);
-    InputKind localInputKind() const;
+    void setLocalInputKind(InputKind kind) override;
+    InputKind localInputKind() const override;
     // People in the lobby (player index order, including the host). During a match, the list at start
-    const std::vector<LobbyMember>& lobbyMembers() const;
+    const std::vector<LobbyMember>& lobbyMembers() const override;
     // Host only: lobby → running. Sends seed and matchData (match setting decided by the game) to everyone.
-    void startMatch(u64 seed, u32 matchData);
+    void startMatch(u64 seed, u32 matchData) override;
     // Host only: running → lobby (after the results screen). Clients also return to the lobby and everyone's ready is cleared. The next startMatch is a new match
-    void returnToLobby();
-    u32 matchIndex() const; // number of matches started (the first match is 1)
+    void returnToLobby() override;
+    u32 matchIndex() const override; // number of matches started (the first match is 1)
     // Call every frame: receive packets, confirm, send.
     void update(f64 now);
     void shutdown();
     // Closes the session (notifying peers) and returns to the start (Idle). Content hash, build settings, and name remain (leaving to the menu)
     void reset();
 
-    SessionState state() const;
-    const char* endReason() const;
-    bool isHost() const;
-    bool isOffline() const;
-    u8 localPlayer() const;
-    u32 playerCount() const;      // match player count (confirmed after Running)
-    u32 lobbyPlayerCount() const; // lobby player count
-    u32 maxPlayers() const;
-    u64 seed() const;
-    u32 matchData() const;
-    u32 inputDelay() const;
+    SessionState state() const override;
+    const char* endReason() const override;
+    bool isHost() const override;
+    bool isOffline() const override;
+    u8 localPlayer() const override;
+    u32 playerCount() const override;      // match player count (confirmed after Running)
+    u32 lobbyPlayerCount() const override; // lobby player count
+    u32 maxPlayers() const override;
+    u64 seed() const override;
+    u32 matchData() const override;
+    u32 inputDelay() const override;
 
-    bool canExecute(u32 tick) const;
-    const TickInputs& inputs(u32 tick) const;
+    bool canExecute(u32 tick) const override;
+    const TickInputs& inputs(u32 tick) const override;
     // Call right after running tick T.
-    void tickExecuted(u32 tick, u64 stateHash);
+    void tickExecuted(u32 tick, u64 stateHash) override;
     // Players connected during the match (bit = player index, as of executed ticks: changes when connect/disconnect commands execute)
-    u32 connectedMask() const;
+    u32 connectedMask() const override;
     // Host migration: when the host leaves (Handoff) or is silent for 3 seconds mid-match, the next person on the succession list takes over as host (isHost() changes).
     // hostAddress: the current host when a client (account id for Steam), successorAddress: the next host when host (to match the lobby owner)
-    u32 hostMigrations() const;
+    u32 hostMigrations() const override;
     Address hostAddress() const;
     Address successorAddress() const;
 
     // Late join (host): a snapshot is needed for the joiner. The game provides it between ticks with provideSnapshot(next tick to run, bytes)
-    bool snapshotWanted() const;
-    void provideSnapshot(u32 tick, const std::vector<u8>& bytes);
+    bool snapshotWanted() const override;
+    void provideSnapshot(u32 tick, const std::vector<u8>& bytes) override;
     // Late join (client): the first tick of Running (0 if started from the beginning). The game takes the snapshot bytes once
-    u32 joinTick() const;
-    bool takeJoinSnapshot(std::vector<u8>& out);
+    u32 joinTick() const override;
+    bool takeJoinSnapshot(std::vector<u8>& out) override;
     // Catching up on confirmed ticks after joining: the game runs many per frame, and my input is sent only after catching up
-    bool catchingUp() const;
+    bool catchingUp() const override;
     // Submits local input for tick (executed tick + inputDelay).
-    void submitLocalInput(u32 tick, const PlayerInput& input);
+    void submitLocalInput(u32 tick, const PlayerInput& input) override;
     // Sends a confirmed command (only when Running, size 1..kMaxCommandBytes). It goes into the next tick the host confirms. false if the queue is full.
-    bool submitCommand(const void* data, u32 size);
+    bool submitCommand(const void* data, u32 size) override;
 
     // Chat (lobby/mid-match, outside ticks): sends one line (cut to kMaxChatBytes). The host distributes to everyone in order, resending until acknowledged.
     // false for empty lines or sending faster than kChatInterval. Not included in input recordings/replays
-    bool sendChat(const std::string& text);
-    const std::vector<ChatMessage>& chatLog() const; // in received order, the last kChatLogSize lines (including mine)
+    bool sendChat(const std::string& text) override;
+    const std::vector<ChatMessage>& chatLog() const override; // in received order, the last kChatLogSize lines (including mine)
 
-    bool desynced() const;
-    u32 desyncTick() const;
-    const SessionStats& stats() const;
+    bool desynced() const override;
+    u32 desyncTick() const override;
+    const SessionStats& stats() const override;
     // Per-player round-trip time to the host (ms, measured by the host during lobby/match and distributed to everyone. 0 for the host)
-    u32 pingMs(u32 player) const;
+    u32 pingMs(u32 player) const override;
     // The match is stalled waiting for these players' inputs (bit = player index, only when stalled over 0.15 s).
     // Clients get the value the host reported; if the host's bundles haven't come for over 0.3 s, the host (bit 0)
-    u32 waitingFor() const;
+    u32 waitingFor() const override;
 
 private:
     struct Impl;
     Impl* m;
 };
-
-// Cuts a UTF-8 string to at most maxBytes on character boundaries (names, chat)
-std::string clampUtf8(const std::string& text, u32 maxBytes);
 
 } // namespace mealkit::net

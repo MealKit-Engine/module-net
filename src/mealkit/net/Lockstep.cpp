@@ -285,13 +285,6 @@ u32 buildId() {
     return id;
 }
 
-std::string clampUtf8(const std::string& text, u32 maxBytes) {
-    if (text.size() <= maxBytes) return text;
-    size_t end = maxBytes;
-    while (end > 0 && (static_cast<u8>(text[end]) & 0xC0) == 0x80) --end; // don't cut in the middle of a character
-    return text.substr(0, end);
-}
-
 struct LockstepSession::Impl {
     SessionState state = SessionState::Idle;
     std::string endReason;
@@ -2016,14 +2009,6 @@ void LockstepSession::setCrossplay(bool allowed) {
 }
 bool LockstepSession::crossplay() const { return m->crossplay; }
 
-const char* inputKindName(InputKind kind) {
-    switch (kind) {
-    case InputKind::KeyboardMouse: return "keyboard/mouse";
-    case InputKind::Gamepad: return "gamepad";
-    case InputKind::Touch: return "touch";
-    }
-    return "?";
-}
 const std::vector<LobbyMember>& LockstepSession::lobbyMembers() const { return m->members; }
 
 void LockstepSession::startMatch(u64 seed, u32 matchData) {

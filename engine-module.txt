@@ -5,6 +5,6 @@ name net
 version 0.1.0
 kernel 0.9
 kind sim
-requires
+requires session 0.1
 tag net
 summary Lockstep sessions, sockets, LAN rooms, relays, host migration
