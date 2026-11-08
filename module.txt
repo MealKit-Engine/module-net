@@ -1,11 +1,12 @@
-# Engine module manifest (docs/ENGINE_MODULES.md "Manifest"). Checked by tools\check_modules.ps1.
+# MealKit module manifest, engine module (docs/ENGINE_MODULES.md "Manifest"; source modules: docs/MODULES.md). Checked by tools\check_modules.ps1.
 # requires: modules this folder may include besides the kernel (core, platform, jobs), as name minVersion.
-@format engine-module 1
+@format module 1
+type engine
 name net
-version 0.1.1
-kernel 0.9
+version 0.1.2
+engine 0.9
 kind sim
 layer core
 requires session 0.1
-tag net
+tags net
 summary Lockstep sessions, sockets, LAN rooms, relays, host migration
