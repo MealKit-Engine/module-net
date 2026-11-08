@@ -1,4 +1,4 @@
-# MealKit-Net
+# module-net
 
 > **Beta.** MealKit is in beta: interfaces may still change between minor versions.
 
