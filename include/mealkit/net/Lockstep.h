@@ -62,24 +62,11 @@ using session::SessionState;
 using session::SessionStats;
 using session::TickInputs;
 
-// Automatic input delay adjustment (host): set at match start from round-trip times measured in the lobby, and changed 1 tick at a time mid-match from the same tick for everyone via an engine confirmed command
-struct AutoDelay {
-    bool enabled = false;
-    f32 tickMs = 1000.0f / 30.0f; // length of one tick (project tick rate)
-    u32 minTicks = 2;             // never shorter than this, even on the same router
-    u32 maxTicks = 8;             // peers farther than this stutter (the lobby warns)
-};
-
-// Input delay (ticks) for this round-trip time (ms): time for the farthest peer's input to reach everyone via the host + jitter margin + one tick
-u32 delayForRtt(f32 rttMs, const AutoDelay& autoDelay);
-
-// Value that differs per executable (used instead when the simulation version is unknown)
-u32 buildId();
-// Determinism group: compiler and CPU ("msvc-x64", "clang-x64", "clang-arm64" ...). Until cross-platform determinism is verified (stage 5)
-// peers in a different group are rejected
-const char* determinismGroup();
-// Operating system ("windows", "linux", "macos", ...): players who turn crossplay off only meet peers of the same one
-const char* platformName();
+using session::AutoDelay;
+using session::buildId;
+using session::delayForRtt;
+using session::determinismGroup;
+using session::platformName;
 
 class LockstepSession final : public session::Session {
 public:

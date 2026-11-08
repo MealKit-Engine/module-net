@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mealkit/net/Socket.h"
+#include "mealkit/platform/Socket.h"
 
 #include <memory>
 

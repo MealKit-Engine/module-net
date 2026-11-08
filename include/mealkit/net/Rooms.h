@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mealkit/core/Types.h"
-#include "mealkit/net/Socket.h"
+#include "mealkit/platform/Socket.h"
 
 #include <string>
 #include <vector>
