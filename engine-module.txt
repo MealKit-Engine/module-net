@@ -1,0 +1,10 @@
+# Engine module manifest (docs/ENGINE_MODULES.md "Manifest"). Checked by tools\check_modules.ps1.
+# requires: modules this folder may include besides the kernel (core, platform, jobs), as name minVersion.
+@format engine-module 1
+name net
+version 0.1.0
+kernel 0.9
+kind sim
+requires
+tag net
+summary Lockstep sessions, sockets, LAN rooms, relays, host migration
