@@ -261,6 +261,8 @@ struct LockstepSession::Impl {
     u32 playerCount = 1;
     u32 lobbyCount = 0;
     u8 localPlayer = 0;
+    bool dedicated = false;             // host: a headless server that holds slot 0 without playing (hostDedicated)
+    u32 hostSlots() const { return dedicated ? 0u : 1u; } // player slots the host itself takes
     u64 seed = 0;
     u32 matchData = 0;
     u32 inputDelay = 3;
@@ -651,14 +653,16 @@ struct LockstepSession::Impl {
 
     void rebuildMembers() {
         members.clear();
-        LobbyMember self;
-        self.player = localPlayer; // a successor host may not be 0
-        self.name = displayName(localName, localPlayer);
-        self.ready = true; // the host is the one who starts
-        self.host = true;
-        self.input = localInput;
-        self.loadout = localLoadout;
-        members.push_back(std::move(self));
+        if (!dedicated) { // a dedicated server is nobody's teammate: it isn't listed
+            LobbyMember self;
+            self.player = localPlayer; // a successor host may not be 0
+            self.name = displayName(localName, localPlayer);
+            self.ready = true; // the host is the one who starts
+            self.host = true;
+            self.input = localInput;
+            self.loadout = localLoadout;
+            members.push_back(std::move(self));
+        }
         for (const Peer& p : peers) {
             LobbyMember entry;
             entry.player = p.playerId;
@@ -846,7 +850,7 @@ struct LockstepSession::Impl {
             id = departed[found].playerId;
             departed.erase(departed.begin() + static_cast<std::ptrdiff_t>(found));
         } else {
-            if (1 + peers.size() + departed.size() >= maxPlayers) {
+            if (hostSlots() + peers.size() + departed.size() >= maxPlayers) {
                 sendReject(from, Reject::Full);
                 return nullptr;
             }
@@ -949,7 +953,7 @@ struct LockstepSession::Impl {
                     sendReject(from, Reject::InProgress);
                     return;
                 }
-                if (1 + peers.size() >= maxPlayers) {
+                if (hostSlots() + peers.size() >= maxPlayers) {
                     sendReject(from, Reject::Full);
                     return;
                 }
@@ -962,7 +966,7 @@ struct LockstepSession::Impl {
                 peers.push_back(p);
                 std::sort(peers.begin(), peers.end(), [](const Peer& a, const Peer& b) { return a.playerId < b.playerId; });
                 peer = findPeer(from);
-                MEALKIT_INFO("Player joined from %s (%zu/%u)", from.toString().c_str(), peers.size() + 1, maxPlayers);
+                MEALKIT_INFO("Player joined from %s (%zu/%u)", from.toString().c_str(), peers.size() + hostSlots(), maxPlayers);
             }
             rttSample(*peer, hostEcho);
             if (state == SessionState::Lobby) { // new values every lobby signal
@@ -1126,8 +1130,10 @@ struct LockstepSession::Impl {
             ++count;
         };
         entry(localPlayer, true, localToken, localName, Address{});
-        for (const Peer& p : peers) entry(p.playerId, true, p.token, p.name, p.address);
-        for (const Departed& d : departed) entry(d.playerId, false, d.token, d.name, Address{});
+        if (!dedicated) { // nobody takes over a dedicated server: a list of only the host leaves clients with no successor (the match ends)
+            for (const Peer& p : peers) entry(p.playerId, true, p.token, p.name, p.address);
+            for (const Departed& d : departed) entry(d.playerId, false, d.token, d.name, Address{});
+        }
         w.data[countAt] = count;
         for (const Peer& p : peers) send(p.address, w);
         lastSuccession = now;
@@ -1595,7 +1601,11 @@ struct LockstepSession::Impl {
             seed = matchSeed;
             matchData = data;
             matchIndex = index;
-            for (size_t i = 0; i < members.size(); ++i) members[i].player = static_cast<u8>(i); // no gaps in indices, like the host
+            { // no gaps in indices, like the host (a dedicated host's slot 0 isn't in the list)
+                bool listsHost = false;
+                for (const LobbyMember& member : members) listsHost = listsHost || member.host;
+                for (size_t i = 0; i < members.size(); ++i) members[i].player = static_cast<u8>(i + (listsHost ? 0 : 1));
+            }
             beginRunning();
             MEALKIT_INFO("Match started: player %u of %u, input delay %u ticks", id, count, delay);
             sendInput(); // acknowledge the start
@@ -1882,6 +1892,16 @@ bool LockstepSession::host(u16 port, u32 maxPlayers, u32 inputDelay, bool loopba
     return hostWith(std::move(udp), maxPlayers, inputDelay);
 }
 
+bool LockstepSession::hostDedicated(u16 port, u32 maxPlayers, u32 inputDelay, bool loopbackOnly) {
+    if (m->state != SessionState::Idle) return false;
+    m->dedicated = true;
+    if (host(port, maxPlayers, inputDelay, loopbackOnly)) return true;
+    m->dedicated = false;
+    return false;
+}
+
+bool LockstepSession::dedicated() const { return m->dedicated; }
+
 bool LockstepSession::join(const Address& hostAddress) {
     if (m->state != SessionState::Idle) return false;
     if (!startup()) return false;
@@ -1895,7 +1915,7 @@ bool LockstepSession::hostWith(std::unique_ptr<Transport> transport, u32 maxPlay
     if (m->state != SessionState::Idle || !transport) return false;
     m->transport = withConditions(std::move(transport), m->conditions);
     m->host = true;
-    m->maxPlayers = std::clamp(maxPlayers, 1u, kMaxPlayers);
+    m->maxPlayers = std::clamp(maxPlayers, 1u, kMaxPlayers - (m->dedicated ? 1u : 0u)); // a dedicated server keeps slot 0
     m->inputDelay = std::clamp(inputDelay, 1u, 30u);
     m->playerCount = 1;
     m->localPlayer = 0;
@@ -1974,7 +1994,7 @@ void LockstepSession::startMatch(u64 seed, u32 matchData) {
     m->loadouts[0] = m->localLoadout;
     // Renumber without gaps (indices are empty if someone left the lobby)
     for (size_t i = 0; i < m->peers.size(); ++i) m->loadouts[i + 1] = m->peers[i].loadout;
-    for (size_t i = 0; i < m->members.size(); ++i) m->members[i].player = static_cast<u8>(i);
+    for (size_t i = 0; i < m->members.size(); ++i) m->members[i].player = static_cast<u8>(i + (m->dedicated ? 1u : 0u));
     m->seed = seed;
     m->matchData = matchData;
     if (m->autoDelay.enabled && !m->offline) { // from round-trip times measured in the lobby
@@ -1999,6 +2019,11 @@ void LockstepSession::startMatch(u64 seed, u32 matchData) {
         for (HashEntry& e : p.reported) e = HashEntry{};
     }
     m->beginRunning();
+    if (m->dedicated) { // slot 0 is the server: no input is waited for, and everyone's simulation sees it as not connected
+        m->requiredFrom[0] = kNoTick;
+        m->connected &= ~1u;
+        m->queuePresence(0, false, {});
+    }
     MEALKIT_INFO("Match %u started with %u player(s), seed %016llx", m->matchIndex, m->playerCount,
                  static_cast<unsigned long long>(seed));
 }
@@ -2055,7 +2080,7 @@ void LockstepSession::update(f64 now) {
 void LockstepSession::shutdown() {
     if (m->state == SessionState::Connecting || m->state == SessionState::Lobby || m->state == SessionState::Running) {
         // The host is leaving: the rest continue per the succession list (host migration). Ending is end()'s Disconnect
-        const bool handoff = m->host && !m->offline && !m->peers.empty() && m->state != SessionState::Connecting;
+        const bool handoff = m->host && !m->dedicated && !m->offline && !m->peers.empty() && m->state != SessionState::Connecting;
         if (handoff) m->sendSuccession(); // the final list (so it arrives before the Handoff)
         Writer w;
         header(w, handoff ? Packet::Handoff : Packet::Disconnect);
@@ -2097,7 +2122,7 @@ bool LockstepSession::isOffline() const { return m->offline; }
 u8 LockstepSession::localPlayer() const { return m->localPlayer; }
 u32 LockstepSession::playerCount() const { return m->playerCount; }
 u32 LockstepSession::lobbyPlayerCount() const {
-    return m->host ? 1 + static_cast<u32>(m->peers.size()) : m->lobbyCount;
+    return m->host ? m->hostSlots() + static_cast<u32>(m->peers.size()) : m->lobbyCount;
 }
 u32 LockstepSession::maxPlayers() const { return m->maxPlayers; }
 u64 LockstepSession::seed() const { return m->seed; }
@@ -2153,12 +2178,13 @@ void LockstepSession::tickExecuted(u32 tick, u64 stateHash) {
 
 void LockstepSession::submitLocalInput(u32 tick, const PlayerInput& input) {
     if (m->state != SessionState::Running || m->replay || m->catchingUp) return;
-    m->lastLocalInput = input;
+    // A dedicated server plays nobody, but this empty input is how its simulation claims the next ticks, so they confirm even when every client is gone
+    m->lastLocalInput = m->dedicated ? PlayerInput{} : input;
     if (m->host) {
         if (tick < m->finalNext) return; // a tick already submitted because the delay shrank (confirmed ones aren't changed)
         Slot& s = m->claim(tick);
         if (s.mask & (1u << m->localPlayer)) return;
-        s.inputs.players[m->localPlayer] = input;
+        s.inputs.players[m->localPlayer] = m->lastLocalInput;
         s.mask |= 1u << m->localPlayer;
         if (m->finalize() && !m->offline) {
             for (Peer& p : m->peers) m->sendBundle(p); // distribute as soon as confirmed (minimizes delay)

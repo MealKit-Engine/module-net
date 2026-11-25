@@ -109,6 +109,11 @@ public:
     u32 replayTicks() const override; // number of recorded ticks (0 if not a replay)
     // loopbackOnly: for same-PC tests (no firewall prompt)
     bool host(u16 port, u32 maxPlayers, u32 inputDelay, bool loopbackOnly = false);
+    // Dedicated server: the same host, but it plays nobody. It keeps slot 0 (simulations see it as not connected from the first tick, its input isn't waited for),
+    // isn't listed in the lobby, clients take slots 1..7 (maxPlayers is clamped to kMaxPlayers - 1) and there is no host migration: when it closes or dies the match ends
+    // for everyone. It still runs the simulation (to confirm hashes and to snapshot for late joiners); what it submits through submitLocalInput is always empty input.
+    bool hostDedicated(u16 port, u32 maxPlayers, u32 inputDelay, bool loopbackOnly = false);
+    bool dedicated() const;
     bool join(const Address& hostAddress);
     // Create/join a room over another transport (Steam etc.)
     bool hostWith(std::unique_ptr<Transport> transport, u32 maxPlayers, u32 inputDelay);
