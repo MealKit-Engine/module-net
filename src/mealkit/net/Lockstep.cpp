@@ -49,6 +49,17 @@ constexpr f64 kHostLost = 3.0;           // client: if the host is silent this l
 constexpr f64 kMigrateHold = 1.0;        // new host: time to wait for other peers' further confirmed ticks (doesn't confirm on its own meanwhile)
 constexpr f64 kTickRequestInterval = 0.1;
 constexpr f64 kUpdateGap = 0.5;          // client: if the gap between updates is longer than this (I was stalled), that time isn't counted as silence
+
+// Whether a peer computes the same simulation: its determinism group, or a pair verified to give the same per-tick hashes
+// (docs/CHANGELOG.md "Browser determinism check"): the browser build (wasm) and Linux x64 Clang
+bool sameSimulationGroup(const std::string& group, const std::string& platform) {
+    if (group == determinismGroup()) return true;
+    const auto browser = [](const std::string& g, const std::string& p) { return g == "clang-other" && p == "web"; };
+    const auto linuxClang = [](const std::string& g, const std::string& p) { return g == "clang-x64" && p == "linux"; };
+    const std::string myGroup = determinismGroup(), myPlatform = platformName();
+    return (browser(group, platform) && linuxClang(myGroup, myPlatform)) ||
+           (linuxClang(group, platform) && browser(myGroup, myPlatform));
+}
 constexpr u32 kUnknownSeq = 0xFFFFFFFFu; // new host: this peer's command/chat numbers aren't known yet (start from the first received)
 
 enum class Packet : u8 {
@@ -331,7 +342,7 @@ struct LockstepSession::Impl {
     std::deque<TickInputs> joinLog;     // host: confirmed ticks to send to catching-up players (including those pushed out of the ring buffer)
     u32 joinLogBase = 0;
     bool joinLogging = false;
-    bool late = false;                  // client: joined mid-match
+    bool late = false;                  // client: joined mid-match and not caught up yet (can't take over as host)
     u32 joinTick = 0;                   // client: the snapshot's tick (0 if from the start)
     u32 joinRaw = 0, joinCompressed = 0;
     std::vector<u8> joinBuffer;         // client: compressed snapshot being received (full size, chunks filled out of order)
@@ -921,9 +932,10 @@ struct LockstepSession::Impl {
             const bool peerCrossplay = r.get<u8>() != 0;
             if (!r.ok) return;
             // Must be the same simulation: determinism group (compiler/CPU) → simulation version (game version + simulation source) → game data
-            if (group != determinismGroup() || build != mySimVersion()) {
+            const bool sameGroup = sameSimulationGroup(group, platform);
+            if (!sameGroup || build != mySimVersion()) {
                 if (!acceptOtherBuilds) {
-                    sendReject(from, group != determinismGroup() ? Reject::Platform : Reject::Version);
+                    sendReject(from, !sameGroup ? Reject::Platform : Reject::Version);
                     return;
                 }
                 if (!peer) MEALKIT_WARN("Accepting a peer with a different build (%s %s, test option)", group.c_str(), version.c_str());
@@ -998,6 +1010,7 @@ struct LockstepSession::Impl {
                 requiredFrom[peer->playerId] = std::max(first, finalNext);
                 peer->inputNext = requiredFrom[peer->playerId];
                 MEALKIT_INFO("Player %u is caught up: inputs from tick %u", peer->playerId, peer->inputNext);
+                lastSuccession = -1.0; // can take over from now: send the list right away
             }
 
             peer->bundleNext = std::max(peer->bundleNext, std::min(bundleNext, finalNext));
@@ -1111,7 +1124,11 @@ struct LockstepSession::Impl {
         }
     }
 
-    // Host → client: succession list (me, then connected clients and players disconnected mid-match, in slot order). If not everything fits, only the front part
+    // Host: someone who came into the running match and hasn't caught up yet (no inputs from them): can't take over
+    bool joining(const Peer& p) const { return state == SessionState::Running && p.late && requiredFrom[p.playerId] == kNoTick; }
+
+    // Host → client: succession list (me, then connected clients and players disconnected mid-match, in slot order; peers
+    // still joining are listed like disconnected ones, so nobody hands over to them). If not everything fits, only the front part
     void sendSuccession() {
         Writer w;
         header(w, Packet::Succession);
@@ -1131,7 +1148,7 @@ struct LockstepSession::Impl {
         };
         entry(localPlayer, true, localToken, localName, Address{});
         if (!dedicated) { // nobody takes over a dedicated server: a list of only the host leaves clients with no successor (the match ends)
-            for (const Peer& p : peers) entry(p.playerId, true, p.token, p.name, p.address);
+            for (const Peer& p : peers) entry(p.playerId, !joining(p), p.token, p.name, p.address);
             for (const Departed& d : departed) entry(d.playerId, false, d.token, d.name, Address{});
         }
         w.data[countAt] = count;
@@ -1511,6 +1528,7 @@ struct LockstepSession::Impl {
                     enterLobbyFromMatch();
                 }
                 if (state != SessionState::Lobby) return;
+                late = catchingUp = false; // a match joined late is over: an ordinary member again
                 matchIndex = std::max(matchIndex, hostMatch);
             }
             lobbyCount = count;
@@ -2161,7 +2179,7 @@ void LockstepSession::tickExecuted(u32 tick, u64 stateHash) {
         if (size >= 5 && type == kPresenceCommandType) m->applyPresence(player, data[4] != 0, data + 5, size - 5);
     });
     if (m->catchingUp && tick + 1 + kCaughtUpTicks >= m->finalNext) { // caught up: send from my next input
-        m->catchingUp = false;
+        m->catchingUp = m->late = false;
         m->localSubmittedNext = m->hostInputAckNext = tick + m->inputDelay;
         MEALKIT_INFO("Caught up with the match at tick %u", tick);
     }
@@ -2204,8 +2222,11 @@ u32 LockstepSession::hostMigrations() const { return m->migrations; }
 Address LockstepSession::hostAddress() const { return m->host || m->peers.empty() ? Address{} : m->peers[0].address; }
 
 Address LockstepSession::successorAddress() const {
-    // First client in player index order (the next person on the succession list)
-    return !m->host || m->peers.empty() ? Address{} : m->peers[0].address;
+    // First client in player index order that can take over (the next person on the succession list)
+    if (m->host)
+        for (const Peer& p : m->peers)
+            if (!m->joining(p)) return p.address;
+    return {};
 }
 
 bool LockstepSession::snapshotWanted() const { return m->host && m->state == SessionState::Running && m->snapshotWanted; }
